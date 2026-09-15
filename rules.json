@@ -1,0 +1,938 @@
+{
+  "version": "1.2",
+  "note": "数据驱动优化规则。risk=policy 的项写入 HKLM/HKCU\\SOFTWARE\\Policies，会让 Windows 显示“由你的组织管理”，界面上会标注【策略】并默认不勾选，需手动勾选后才会修改。",
+  "categories": [
+    {
+      "key": "explorer",
+      "name": "资源管理器",
+      "icon": "folder"
+    },
+    {
+      "key": "performance",
+      "name": "性能优化",
+      "icon": "speed"
+    },
+    {
+      "key": "privacy",
+      "name": "隐私保护",
+      "icon": "shield"
+    },
+    {
+      "key": "edge",
+      "name": "Edge 浏览器",
+      "icon": "globe"
+    },
+    {
+      "key": "security",
+      "name": "安全防护",
+      "icon": "lock"
+    },
+    {
+      "key": "system",
+      "name": "系统偏好",
+      "icon": "settings"
+    }
+  ],
+  "rules": [
+    {
+      "id": "exp_searchbox",
+      "category": "explorer",
+      "risk": "safe",
+      "name": "隐藏任务栏搜索框",
+      "desc": "任务栏搜索框改为仅图标/隐藏，腾出任务栏空间",
+      "checkKey": "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Search",
+      "checkValue": "SearchboxTaskbarMode",
+      "optimizedValue": 0,
+      "optimize": [
+        {
+          "op": "reg_set",
+          "key": "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Search",
+          "value": "SearchboxTaskbarMode",
+          "type": "REG_DWORD",
+          "data": 0
+        }
+      ],
+      "restore": [
+        {
+          "op": "reg_del",
+          "key": "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Search",
+          "value": "SearchboxTaskbarMode"
+        }
+      ]
+    },
+    {
+      "id": "exp_taskview",
+      "category": "explorer",
+      "risk": "safe",
+      "name": "隐藏任务视图按钮",
+      "desc": "去掉任务栏上的“任务视图”按钮",
+      "checkKey": "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+      "checkValue": "ShowTaskViewButton",
+      "optimizedValue": 0,
+      "optimize": [
+        {
+          "op": "reg_set",
+          "key": "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+          "value": "ShowTaskViewButton",
+          "type": "REG_DWORD",
+          "data": 0
+        }
+      ],
+      "restore": [
+        {
+          "op": "reg_del",
+          "key": "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+          "value": "ShowTaskViewButton"
+        }
+      ]
+    },
+    {
+      "id": "exp_ext",
+      "category": "explorer",
+      "risk": "safe",
+      "name": "显示文件扩展名",
+      "desc": "让资源管理器始终显示已知文件类型的扩展名，避免 .exe 伪装成 .jpg",
+      "checkKey": "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+      "checkValue": "HideFileExt",
+      "optimizedValue": 0,
+      "optimize": [
+        {
+          "op": "reg_set",
+          "key": "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+          "value": "HideFileExt",
+          "type": "REG_DWORD",
+          "data": 0
+        }
+      ],
+      "restore": [
+        {
+          "op": "reg_set",
+          "key": "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+          "value": "HideFileExt",
+          "type": "REG_DWORD",
+          "data": 1
+        }
+      ]
+    },
+    {
+      "id": "exp_thispc",
+      "category": "explorer",
+      "risk": "safe",
+      "name": "打开资源管理器直接进“此电脑”",
+      "desc": "跳过“快速访问主页”，直接打开此电脑",
+      "checkKey": "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+      "checkValue": "LaunchTo",
+      "optimizedValue": 1,
+      "optimize": [
+        {
+          "op": "reg_set",
+          "key": "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+          "value": "LaunchTo",
+          "type": "REG_DWORD",
+          "data": 1
+        }
+      ],
+      "restore": [
+        {
+          "op": "reg_set",
+          "key": "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+          "value": "LaunchTo",
+          "type": "REG_DWORD",
+          "data": 3
+        }
+      ]
+    },
+    {
+      "id": "exp_recent",
+      "category": "explorer",
+      "risk": "safe",
+      "name": "不记录“最近打开的文件”",
+      "desc": "关闭快速访问的历史记录，保护隐私",
+      "checkKey": "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+      "checkValue": "Start_TrackDocs",
+      "optimizedValue": 0,
+      "optimize": [
+        {
+          "op": "reg_set",
+          "key": "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+          "value": "Start_TrackDocs",
+          "type": "REG_DWORD",
+          "data": 0
+        }
+      ],
+      "restore": [
+        {
+          "op": "reg_set",
+          "key": "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+          "value": "Start_TrackDocs",
+          "type": "REG_DWORD",
+          "data": 1
+        }
+      ]
+    },
+    {
+      "id": "exp_quickaccess",
+      "category": "explorer",
+      "risk": "safe",
+      "name": "快速访问不显示常用文件夹",
+      "desc": "隐藏快速访问里的“常用文件夹”列表",
+      "checkKey": "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer",
+      "checkValue": "ShowFrequent",
+      "optimizedValue": 0,
+      "optimize": [
+        {
+          "op": "reg_set",
+          "key": "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer",
+          "value": "ShowFrequent",
+          "type": "REG_DWORD",
+          "data": 0
+        }
+      ],
+      "restore": [
+        {
+          "op": "reg_del",
+          "key": "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer",
+          "value": "ShowFrequent"
+        }
+      ]
+    },
+    {
+      "id": "exp_autoplay",
+      "category": "explorer",
+      "risk": "safe",
+      "name": "禁止自动播放（防 U 盘病毒）",
+      "desc": "关闭所有驱动器的自动播放，可阻断 autorun.inf 类 U 盘病毒",
+      "checkKey": "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\AutoplayHandlers",
+      "checkValue": "DisableAutoplay",
+      "optimizedValue": 1,
+      "optimize": [
+        {
+          "op": "reg_set",
+          "key": "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\AutoplayHandlers",
+          "value": "DisableAutoplay",
+          "type": "REG_DWORD",
+          "data": 1
+        }
+      ],
+      "restore": [
+        {
+          "op": "reg_del",
+          "key": "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\AutoplayHandlers",
+          "value": "DisableAutoplay"
+        }
+      ]
+    },
+    {
+      "id": "exp_sep",
+      "category": "explorer",
+      "risk": "safe",
+      "name": "在独立进程中打开文件夹窗口",
+      "desc": "一个窗口崩溃不会带走整个资源管理器",
+      "checkKey": "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+      "checkValue": "SeparateProcess",
+      "optimizedValue": 1,
+      "optimize": [
+        {
+          "op": "reg_set",
+          "key": "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+          "value": "SeparateProcess",
+          "type": "REG_DWORD",
+          "data": 1
+        }
+      ],
+      "restore": [
+        {
+          "op": "reg_set",
+          "key": "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+          "value": "SeparateProcess",
+          "type": "REG_DWORD",
+          "data": 0
+        }
+      ]
+    },
+    {
+      "id": "exp_classic_menu",
+      "category": "explorer",
+      "risk": "safe",
+      "name": "Win11 恢复经典右键菜单",
+      "desc": "跳过“显示更多选项”，直接显示完整右键菜单（需重启资源管理器生效）",
+      "checkKey": "HKCU\\SOFTWARE\\Classes\\CLSID\\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\\InprocServer32",
+      "checkValue": "",
+      "optimizedValue": "",
+      "optimize": [
+        {
+          "op": "reg_set",
+          "key": "HKCU\\SOFTWARE\\Classes\\CLSID\\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\\InprocServer32",
+          "value": "",
+          "type": "REG_SZ",
+          "data": ""
+        }
+      ],
+      "restore": [
+        {
+          "op": "reg_del",
+          "key": "HKCU\\SOFTWARE\\Classes\\CLSID\\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}",
+          "value": ""
+        }
+      ]
+    },
+    {
+      "id": "perf_menudelay",
+      "category": "performance",
+      "risk": "safe",
+      "name": "加快菜单弹出速度",
+      "desc": "把菜单弹出延迟从默认 400ms 降为 0",
+      "checkKey": "HKCU\\Control Panel\\Desktop",
+      "checkValue": "MenuShowDelay",
+      "optimizedValue": 0,
+      "optimize": [
+        {
+          "op": "reg_set",
+          "key": "HKCU\\Control Panel\\Desktop",
+          "value": "MenuShowDelay",
+          "type": "REG_SZ",
+          "data": "0"
+        }
+      ],
+      "restore": [
+        {
+          "op": "reg_set",
+          "key": "HKCU\\Control Panel\\Desktop",
+          "value": "MenuShowDelay",
+          "type": "REG_SZ",
+          "data": "400"
+        }
+      ]
+    },
+    {
+      "id": "perf_foreground",
+      "category": "performance",
+      "risk": "safe",
+      "name": "前台程序优先获得响应",
+      "desc": "缩短前台窗口锁定超时，界面更跟手",
+      "checkKey": "HKCU\\Control Panel\\Desktop",
+      "checkValue": "ForegroundLockTimeout",
+      "optimizedValue": 0,
+      "optimize": [
+        {
+          "op": "reg_set",
+          "key": "HKCU\\Control Panel\\Desktop",
+          "value": "ForegroundLockTimeout",
+          "type": "REG_DWORD",
+          "data": 0
+        }
+      ],
+      "restore": [
+        {
+          "op": "reg_set",
+          "key": "HKCU\\Control Panel\\Desktop",
+          "value": "ForegroundLockTimeout",
+          "type": "REG_DWORD",
+          "data": 200000
+        }
+      ]
+    },
+    {
+      "id": "perf_sysmain",
+      "category": "performance",
+      "risk": "safe",
+      "name": "禁用 SysMain（超级预读）",
+      "desc": "机械硬盘/小内存机器可减少后台磁盘占用；SSD 建议保留",
+      "checkKey": "HKLM\\SYSTEM\\CurrentControlSet\\Services\\SysMain",
+      "checkValue": "Start",
+      "optimizedValue": 4,
+      "optimize": [
+        {
+          "op": "svc",
+          "name": "SysMain",
+          "start": 4
+        }
+      ],
+      "restore": [
+        {
+          "op": "svc",
+          "name": "SysMain",
+          "start": 2
+        }
+      ]
+    },
+    {
+      "id": "perf_search",
+      "category": "performance",
+      "risk": "safe",
+      "name": "禁用 Windows Search 索引",
+      "desc": "省下索引占用的磁盘与内存；代价是开始菜单搜索变慢",
+      "checkKey": "HKLM\\SYSTEM\\CurrentControlSet\\Services\\WSearch",
+      "checkValue": "Start",
+      "optimizedValue": 4,
+      "optimize": [
+        {
+          "op": "svc",
+          "name": "WSearch",
+          "start": 4
+        }
+      ],
+      "restore": [
+        {
+          "op": "svc",
+          "name": "WSearch",
+          "start": 2
+        }
+      ]
+    },
+    {
+      "id": "perf_hibernate",
+      "category": "performance",
+      "risk": "safe",
+      "name": "关闭休眠（释放 C 盘 hiberfil.sys）",
+      "desc": "休眠文件通常占用内存大小的 40%，关闭可释放几个 GB",
+      "checkKey": "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Power",
+      "checkValue": "HibernateEnabled",
+      "optimizedValue": 0,
+      "optimize": [
+        {
+          "op": "reg_set",
+          "key": "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Power",
+          "value": "HibernateEnabled",
+          "type": "REG_DWORD",
+          "data": 0
+        }
+      ],
+      "restore": [
+        {
+          "op": "reg_set",
+          "key": "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Power",
+          "value": "HibernateEnabled",
+          "type": "REG_DWORD",
+          "data": 1
+        }
+      ]
+    },
+    {
+      "id": "perf_fastboot",
+      "category": "performance",
+      "risk": "safe",
+      "name": "关闭快速启动",
+      "desc": "快速启动会让部分驱动/更新不生效，双系统用户建议关闭",
+      "checkKey": "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Power",
+      "checkValue": "HiberbootEnabled",
+      "optimizedValue": 0,
+      "optimize": [
+        {
+          "op": "reg_set",
+          "key": "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Power",
+          "value": "HiberbootEnabled",
+          "type": "REG_DWORD",
+          "data": 0
+        }
+      ],
+      "restore": [
+        {
+          "op": "reg_set",
+          "key": "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Power",
+          "value": "HiberbootEnabled",
+          "type": "REG_DWORD",
+          "data": 1
+        }
+      ]
+    },
+    {
+      "id": "perf_bsod",
+      "category": "performance",
+      "risk": "safe",
+      "name": "蓝屏时不自动重启",
+      "desc": "留时间看清蓝屏错误码，便于排查",
+      "checkKey": "HKLM\\SYSTEM\\CurrentControlSet\\Control\\CrashControl",
+      "checkValue": "AutoReboot",
+      "optimizedValue": 0,
+      "optimize": [
+        {
+          "op": "reg_set",
+          "key": "HKLM\\SYSTEM\\CurrentControlSet\\Control\\CrashControl",
+          "value": "AutoReboot",
+          "type": "REG_DWORD",
+          "data": 0
+        }
+      ],
+      "restore": [
+        {
+          "op": "reg_set",
+          "key": "HKLM\\SYSTEM\\CurrentControlSet\\Control\\CrashControl",
+          "value": "AutoReboot",
+          "type": "REG_DWORD",
+          "data": 1
+        }
+      ]
+    },
+    {
+      "id": "priv_telemetry",
+      "category": "privacy",
+      "risk": "safe",
+      "name": "关闭诊断数据收集（服务级）",
+      "desc": "禁用 DiagTrack 遥测服务，减少后台上报（不影响“由组织管理”显示）",
+      "checkKey": "HKLM\\SYSTEM\\CurrentControlSet\\Services\\DiagTrack",
+      "checkValue": "Start",
+      "optimizedValue": 4,
+      "optimize": [
+        {
+          "op": "svc",
+          "name": "DiagTrack",
+          "start": 4
+        }
+      ],
+      "restore": [
+        {
+          "op": "svc",
+          "name": "DiagTrack",
+          "start": 2
+        }
+      ]
+    },
+    {
+      "id": "priv_adid",
+      "category": "privacy",
+      "risk": "safe",
+      "name": "关闭广告 ID",
+      "desc": "禁止应用使用广告标识符做定向投放",
+      "checkKey": "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\AdvertisingInfo",
+      "checkValue": "Enabled",
+      "optimizedValue": 0,
+      "optimize": [
+        {
+          "op": "reg_set",
+          "key": "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\AdvertisingInfo",
+          "value": "Enabled",
+          "type": "REG_DWORD",
+          "data": 0
+        }
+      ],
+      "restore": [
+        {
+          "op": "reg_set",
+          "key": "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\AdvertisingInfo",
+          "value": "Enabled",
+          "type": "REG_DWORD",
+          "data": 1
+        }
+      ]
+    },
+    {
+      "id": "priv_activity",
+      "category": "privacy",
+      "risk": "policy",
+      "name": "关闭活动历史记录",
+      "desc": "不记录你在设备上的操作时间线",
+      "checkKey": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\System",
+      "checkValue": "EnableActivityFeed",
+      "optimizedValue": 0,
+      "optimize": [
+        {
+          "op": "reg_set",
+          "key": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\System",
+          "value": "EnableActivityFeed",
+          "type": "REG_DWORD",
+          "data": 0
+        }
+      ],
+      "restore": [
+        {
+          "op": "reg_del",
+          "key": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\System",
+          "value": "EnableActivityFeed"
+        }
+      ]
+    },
+    {
+      "id": "priv_clipboard",
+      "category": "privacy",
+      "risk": "safe",
+      "name": "启用剪贴板历史记录",
+      "desc": "Win+V 可调出最近复制过的多条内容",
+      "checkKey": "HKCU\\SOFTWARE\\Microsoft\\Clipboard",
+      "checkValue": "EnableClipboardHistory",
+      "optimizedValue": 1,
+      "optimize": [
+        {
+          "op": "reg_set",
+          "key": "HKCU\\SOFTWARE\\Microsoft\\Clipboard",
+          "value": "EnableClipboardHistory",
+          "type": "REG_DWORD",
+          "data": 1
+        }
+      ],
+      "restore": [
+        {
+          "op": "reg_del",
+          "key": "HKCU\\SOFTWARE\\Microsoft\\Clipboard",
+          "value": "EnableClipboardHistory"
+        }
+      ]
+    },
+    {
+      "id": "priv_suggestions",
+      "category": "privacy",
+      "risk": "safe",
+      "name": "关闭“开始”菜单建议与推广",
+      "desc": "禁止开始菜单推荐应用和“获取技巧与建议”",
+      "checkKey": "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager",
+      "checkValue": "SubscribedContent-338388Enabled",
+      "optimizedValue": 0,
+      "optimize": [
+        {
+          "op": "reg_set",
+          "key": "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager",
+          "value": "SubscribedContent-338388Enabled",
+          "type": "REG_DWORD",
+          "data": 0
+        }
+      ],
+      "restore": [
+        {
+          "op": "reg_del",
+          "key": "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager",
+          "value": "SubscribedContent-338388Enabled"
+        }
+      ]
+    },
+    {
+      "id": "priv_lockscreen",
+      "category": "privacy",
+      "risk": "safe",
+      "name": "关闭锁屏聚焦推广",
+      "desc": "锁屏不再显示微软推广内容与广告图",
+      "checkKey": "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager",
+      "checkValue": "RotatingLockScreenOverlayEnabled",
+      "optimizedValue": 0,
+      "optimize": [
+        {
+          "op": "reg_set",
+          "key": "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager",
+          "value": "RotatingLockScreenOverlayEnabled",
+          "type": "REG_DWORD",
+          "data": 0
+        }
+      ],
+      "restore": [
+        {
+          "op": "reg_del",
+          "key": "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager",
+          "value": "RotatingLockScreenOverlayEnabled"
+        }
+      ]
+    },
+    {
+      "id": "priv_tracking",
+      "category": "privacy",
+      "risk": "safe",
+      "name": "禁用应用启动跟踪",
+      "desc": "不记录你启动了哪些应用",
+      "checkKey": "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+      "checkValue": "Start_TrackProgs",
+      "optimizedValue": 0,
+      "optimize": [
+        {
+          "op": "reg_set",
+          "key": "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+          "value": "Start_TrackProgs",
+          "type": "REG_DWORD",
+          "data": 0
+        }
+      ],
+      "restore": [
+        {
+          "op": "reg_set",
+          "key": "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+          "value": "Start_TrackProgs",
+          "type": "REG_DWORD",
+          "data": 1
+        }
+      ]
+    },
+    {
+      "id": "edge_bg",
+      "category": "edge",
+      "risk": "policy",
+      "name": "Edge 关闭后不再驻留后台",
+      "desc": "关闭“启动增强”和后台扩展，释放内存",
+      "checkKey": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Edge",
+      "checkValue": "BackgroundModeEnabled",
+      "optimizedValue": 0,
+      "optimize": [
+        {
+          "op": "reg_set",
+          "key": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Edge",
+          "value": "BackgroundModeEnabled",
+          "type": "REG_DWORD",
+          "data": 0
+        }
+      ],
+      "restore": [
+        {
+          "op": "reg_del",
+          "key": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Edge",
+          "value": "BackgroundModeEnabled"
+        }
+      ]
+    },
+    {
+      "id": "edge_updstop",
+      "category": "edge",
+      "risk": "safe",
+      "name": "停止 Edge 自动更新服务",
+      "desc": "禁用 edgeupdate / edgeupdatem 服务（改服务启动类型，不写 Policies）",
+      "checkKey": "HKLM\\SYSTEM\\CurrentControlSet\\Services\\edgeupdate",
+      "checkValue": "Start",
+      "optimizedValue": 4,
+      "optimize": [
+        {
+          "op": "svc",
+          "name": "edgeupdate",
+          "start": 4
+        }
+      ],
+      "restore": [
+        {
+          "op": "svc",
+          "name": "edgeupdate",
+          "start": 2
+        }
+      ]
+    },
+    {
+      "id": "edge_newtab",
+      "category": "edge",
+      "risk": "policy",
+      "name": "新标签页隐藏热门站点",
+      "desc": "新标签页更干净，去掉推荐内容",
+      "checkKey": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Edge",
+      "checkValue": "NewTabPageContentEnabled",
+      "optimizedValue": 0,
+      "optimize": [
+        {
+          "op": "reg_set",
+          "key": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Edge",
+          "value": "NewTabPageContentEnabled",
+          "type": "REG_DWORD",
+          "data": 0
+        }
+      ],
+      "restore": [
+        {
+          "op": "reg_del",
+          "key": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Edge",
+          "value": "NewTabPageContentEnabled"
+        }
+      ]
+    },
+    {
+      "id": "sec_uac",
+      "category": "security",
+      "risk": "policy",
+      "name": "UAC 保持默认（推荐不改）",
+      "desc": "把 UAC 提示级别锁定在默认第 3 级；把 UAC 调到“从不通知”等于关掉提权防护，本工具不提供该选项",
+      "checkKey": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+      "checkValue": "ConsentPromptBehaviorAdmin",
+      "optimizedValue": 5,
+      "optimize": [
+        {
+          "op": "reg_set",
+          "key": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+          "value": "ConsentPromptBehaviorAdmin",
+          "type": "REG_DWORD",
+          "data": 5
+        }
+      ],
+      "restore": [
+        {
+          "op": "reg_del",
+          "key": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+          "value": "ConsentPromptBehaviorAdmin"
+        }
+      ]
+    },
+    {
+      "id": "sec_smartscreen_on",
+      "category": "security",
+      "risk": "safe",
+      "name": "确保 SmartScreen 处于开启状态",
+      "desc": "与“优化工具关 SmartScreen”相反：这里主动把它打开，拦截未知下载",
+      "checkKey": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer",
+      "checkValue": "SmartScreenEnabled",
+      "optimizedValue": "Warn",
+      "optimize": [
+        {
+          "op": "reg_set",
+          "key": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer",
+          "value": "SmartScreenEnabled",
+          "type": "REG_SZ",
+          "data": "Warn"
+        }
+      ],
+      "restore": [
+        {
+          "op": "reg_del",
+          "key": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer",
+          "value": "SmartScreenEnabled"
+        }
+      ]
+    },
+    {
+      "id": "sec_autorun_off",
+      "category": "security",
+      "risk": "policy",
+      "name": "全局禁用所有驱动器的 AutoRun",
+      "desc": "可有效阻断 U 盘/移动硬盘的 autorun.inf 传播（对 Synaptics 这类蠕虫尤其重要）",
+      "checkKey": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer",
+      "checkValue": "NoDriveTypeAutoRun",
+      "optimizedValue": 255,
+      "optimize": [
+        {
+          "op": "reg_set",
+          "key": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer",
+          "value": "NoDriveTypeAutoRun",
+          "type": "REG_DWORD",
+          "data": 255
+        }
+      ],
+      "restore": [
+        {
+          "op": "reg_del",
+          "key": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer",
+          "value": "NoDriveTypeAutoRun"
+        }
+      ]
+    },
+    {
+      "id": "sec_lua",
+      "category": "security",
+      "risk": "policy",
+      "name": "始终以管理员批准模式运行",
+      "desc": "确保提权仍走 UAC 审批，而不是静默提权",
+      "checkKey": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+      "checkValue": "EnableLUA",
+      "optimizedValue": 1,
+      "optimize": [
+        {
+          "op": "reg_set",
+          "key": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+          "value": "EnableLUA",
+          "type": "REG_DWORD",
+          "data": 1
+        }
+      ],
+      "restore": [
+        {
+          "op": "reg_del",
+          "key": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+          "value": "EnableLUA"
+        }
+      ]
+    },
+    {
+      "id": "sys_bootmenu",
+      "category": "system",
+      "risk": "safe",
+      "name": "缩短系统启动菜单等待时间",
+      "desc": "多系统菜单超时从 30 秒缩短为 5 秒",
+      "checkKey": "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\BootConfig",
+      "checkValue": "Timeout",
+      "optimizedValue": 5,
+      "optimize": [
+        {
+          "op": "reg_set",
+          "key": "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\BootConfig",
+          "value": "Timeout",
+          "type": "REG_DWORD",
+          "data": 5
+        }
+      ],
+      "restore": [
+        {
+          "op": "reg_set",
+          "key": "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\BootConfig",
+          "value": "Timeout",
+          "type": "REG_DWORD",
+          "data": 30
+        }
+      ]
+    },
+    {
+      "id": "sys_nokill",
+      "category": "system",
+      "risk": "safe",
+      "name": "崩溃后不自动关闭应用",
+      "desc": "程序无响应时不自动结束，避免未保存的内容丢失",
+      "checkKey": "HKCU\\Control Panel\\Desktop",
+      "checkValue": "AutoEndTasks",
+      "optimizedValue": 0,
+      "optimize": [
+        {
+          "op": "reg_set",
+          "key": "HKCU\\Control Panel\\Desktop",
+          "value": "AutoEndTasks",
+          "type": "REG_SZ",
+          "data": "0"
+        }
+      ],
+      "restore": [
+        {
+          "op": "reg_set",
+          "key": "HKCU\\Control Panel\\Desktop",
+          "value": "AutoEndTasks",
+          "type": "REG_SZ",
+          "data": "1"
+        }
+      ]
+    },
+    {
+      "id": "sys_showerrors",
+      "category": "system",
+      "risk": "safe",
+      "name": "允许弹出系统错误对话框",
+      "desc": "出问题时能明确知道是哪个程序出错，便于排查",
+      "checkKey": "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Windows",
+      "checkValue": "ErrorMode",
+      "optimizedValue": 0,
+      "optimize": [
+        {
+          "op": "reg_set",
+          "key": "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Windows",
+          "value": "ErrorMode",
+          "type": "REG_DWORD",
+          "data": 0
+        }
+      ],
+      "restore": [
+        {
+          "op": "reg_del",
+          "key": "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Windows",
+          "value": "ErrorMode"
+        }
+      ]
+    },
+    {
+      "id": "sys_uxtheme",
+      "category": "system",
+      "risk": "safe",
+      "name": "保留窗口动画效果",
+      "desc": "不做“关动画换性能”的取舍——现代硬件上关动画只会让体验变差",
+      "checkKey": "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VisualEffects",
+      "checkValue": "VisualFXSetting",
+      "optimizedValue": null,
+      "optimize": [
+        {
+          "op": "reg_del",
+          "key": "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VisualEffects",
+          "value": "VisualFXSetting"
+        }
+      ],
+      "restore": [
+        {
+          "op": "reg_del",
+          "key": "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VisualEffects",
+          "value": "VisualFXSetting"
+        }
+      ]
+    }
+  ]
+}

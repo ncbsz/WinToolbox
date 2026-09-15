@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WinToolbox · 系统工具箱</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="app">
+  <aside class="nav">
+    <div class="nav-brand">
+      <div class="nav-logo">W</div>
+      <div>
+        <div class="nav-title">WinToolbox</div>
+        <div class="nav-sub">系统工具箱 v1.0</div>
+      </div>
+    </div>
+    <div id="nav-list"></div>
+    <div class="nav-foot">
+      <div id="foot-admin">权限：检测中…</div>
+      <div id="foot-py">后端：—</div>
+    </div>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <h1 id="page-title">概览</h1>
+      <div class="spacer"></div>
+      <span class="pill" id="pill-admin">—</span>
+      <button class="btn sm" id="btn-refresh">刷新</button>
+    </header>
+    <div class="content" id="content"></div>
+  </main>
+</div>
+<div class="toasts" id="toasts"></div>
+<script src="app.js"></script>
+</body>
+</html>
