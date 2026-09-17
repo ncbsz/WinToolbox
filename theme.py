@@ -112,6 +112,76 @@ def _map_alpha(op):
     return _ALPHA_MIN + (1.0 - _ALPHA_MIN) * (op - 20) / 80.0
 
 
+# ---------------- 勾选框指示器图标（程序化生成 PNG，QSS 用 url() 引用） ----------------
+# 为什么不用系统默认：全局 QSS 一旦接管 QCheckBox/QTableView，原生指示器就不再
+# 画方框，只剩一个"✓"字形。这里自己画：空框 / 悬停框 / 选中（蓝底白勾）。
+_ICON_CACHE = {}
+
+
+def _draw_indicator(path, size, border, fill=None, check=None):
+    """画一枚勾选框指示器：border=边框色；fill=填充色(None 则空心)；check=勾色。"""
+    from PySide6.QtCore import Qt, QRectF, QPointF
+    from PySide6.QtGui import QImage, QPainter, QPen, QColor
+
+    img = QImage(size, size, QImage.Format_ARGB32)
+    img.fill(Qt.transparent)
+    p = QPainter(img)
+    p.setRenderHint(QPainter.Antialiasing, True)
+    r = QRectF(size * 0.09, size * 0.09, size * 0.82, size * 0.82)
+    radius = size * 0.26
+    if fill:
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(fill))
+        p.drawRoundedRect(r, radius, radius)
+    else:
+        pen = QPen(QColor(border))
+        pen.setWidthF(max(1.2, size * 0.095))
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(r, radius, radius)
+    if check:
+        pen = QPen(QColor(check))
+        pen.setWidthF(max(1.6, size * 0.145))
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        p.setPen(pen)
+        p.drawPolyline([QPointF(size * 0.28, size * 0.53),
+                        QPointF(size * 0.44, size * 0.70),
+                        QPointF(size * 0.74, size * 0.32)])
+    p.end()
+    img.save(path, "PNG")
+    return path
+
+
+def indicator_icons(dark=False, scale=1.0):
+    """返回 {'off','off_hover','on'} 三个 PNG 的绝对路径（带缓存，按主题+缩放生成）。"""
+    import os
+    import tempfile
+    size = max(14, int(round(16 * max(1.0, scale))))
+    key = (bool(dark), size)
+    if key in _ICON_CACHE:
+        return _ICON_CACHE[key]
+    P = DARK if dark else LIGHT
+    d = os.path.join(tempfile.gettempdir(), "wintoolbox_ui")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        d = tempfile.gettempdir()
+    tag = "d" if dark else "l"
+    on_fill, on_check = P["BLUE"], ("#0B1A26" if dark else "#FFFFFF")
+    off_border = "#6E6E6E" if dark else "#8A8A8A"
+    ic = {
+        "off": _draw_indicator(os.path.join(d, "chk_%s_%d_off.png" % (tag, size)),
+                               size, off_border),
+        "off_hover": _draw_indicator(os.path.join(d, "chk_%s_%d_hover.png" % (tag, size)),
+                                     size, P["BLUE"]),
+        "on": _draw_indicator(os.path.join(d, "chk_%s_%d_on.png" % (tag, size)),
+                              size, on_fill, fill=on_fill, check=on_check),
+    }
+    _ICON_CACHE[key] = ic
+    return ic
+
+
 def build_qss(dark=False, scale=1.0, font_base=13, opacity=100):
     """Return the full QSS string.
 
@@ -150,6 +220,26 @@ def build_qss(dark=False, scale=1.0, font_base=13, opacity=100):
     def bgl(name):
         """线条/分隔类颜色：同样随透明度淡化，但保留最低可见度。"""
         return bg_rgba(P[name], max(0.35, alpha))
+
+    # 勾选框指示器：生成 PNG 并拼出 QSS 片段（失败则留空，退回系统默认样式）
+    _chk_qss = ""
+    try:
+        _ic = indicator_icons(dark, scale)
+        _u = lambda p: p.replace("\\", "/")
+        _chk_qss = (
+            "QCheckBox::indicator {{ width: {w}; height: {w}; image: url({off}); }}\n"
+            "QCheckBox::indicator:hover {{ image: url({hov}); }}\n"
+            "QCheckBox::indicator:checked, QCheckBox::indicator:checked:hover "
+            "{{ image: url({on}); }}\n"
+            "QTableView::indicator, QTreeView::indicator, QListView::indicator "
+            "{{ width: {w}; height: {w}; image: url({off}); }}\n"
+            "QTableView::indicator:hover, QTreeView::indicator:hover, "
+            "QListView::indicator:hover {{ image: url({hov}); }}\n"
+            "QTableView::indicator:checked, QTreeView::indicator:checked, "
+            "QListView::indicator:checked {{ image: url({on}); }}\n"
+        ).format(w=s(16), off=_u(_ic["off"]), hov=_u(_ic["off_hover"]), on=_u(_ic["on"]))
+    except Exception:
+        _chk_qss = ""
 
     return f"""
 * {{
@@ -282,11 +372,40 @@ QLineEdit, QComboBox, QSpinBox {{
 }}
 QLineEdit:focus, QComboBox:focus, QSpinBox:focus {{ border: {s(1)} solid {P["BLUE"]}; }}
 QComboBox::drop-down {{ border: none; width: {s(20)}; }}
+/* QSpinBox 被 QSS 样式化后默认上下按钮会失效（上键点不动），
+   必须显式定义 up/down-button 及箭头，热区才可靠 */
+QSpinBox::up-button {{
+    subcontrol-origin: border; subcontrol-position: top right;
+    width: {s(20)}; border: none; background: transparent;
+}}
+QSpinBox::down-button {{
+    subcontrol-origin: border; subcontrol-position: bottom right;
+    width: {s(20)}; border: none; background: transparent;
+}}
+QSpinBox::up-button:hover, QSpinBox::down-button:hover,
+QSpinBox::up-button:pressed, QSpinBox::down-button:pressed {{
+    background: {bg("BLUE_SOFT")};
+}}
+QSpinBox::up-arrow {{
+    width: 0; height: 0;
+    border-left: {s(4)} solid transparent;
+    border-right: {s(4)} solid transparent;
+    border-bottom: {s(5)} solid {P["TEXT"]};
+}}
+QSpinBox::up-arrow:hover, QSpinBox::up-arrow:pressed {{ border-bottom-color: {P["BLUE"]}; }}
+QSpinBox::down-arrow {{
+    width: 0; height: 0;
+    border-left: {s(4)} solid transparent;
+    border-right: {s(4)} solid transparent;
+    border-top: {s(5)} solid {P["TEXT"]};
+}}
+QSpinBox::down-arrow:hover, QSpinBox::down-arrow:pressed {{ border-top-color: {P["BLUE"]}; }}
 QComboBox QAbstractItemView {{
     background: {bg("PANEL")}; border: {s(1)} solid {bgl("LINE2")}; selection-background-color: {bg("BLUE_SOFT")};
     selection-color: {P["BLUE"]}; outline: none;
 }}
 QCheckBox {{ spacing: {s(7)}; background: transparent; }}
+{_chk_qss}
 QCheckBox::indicator {{
     width: {s(16)}; height: {s(16)}; border: {s(1)} solid {bgl("LINE2")};
     border-radius: {s(5)}; background: {bg("PANEL")};

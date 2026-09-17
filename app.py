@@ -7,13 +7,14 @@ WinToolbox — Windows 系统工具箱（桌面版 / PySide6）
 """
 import json
 import os
+import re
 import sys
 import time
 import warnings
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QPointF, QRect
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QPointF, QRect, QFileInfo
 from PySide6.QtGui import QPainter, QColor, QPen, QFont, QIcon, QPixmap, QPolygonF, QBrush, QRegion, QPainterPath, QAction
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFrame, QLabel, QPushButton, QVBoxLayout,
@@ -28,13 +29,18 @@ import server as S
 import theme as T
 
 APP_NAME = "WinToolbox"
-APP_VER = "1.0"
+APP_VER = "1.1"
+AUTHOR = "xixidan"
+GITHUB_URL = "https://github.com/ncbsz/WinToolbox"
 IS_ADMIN = S.is_admin()
-CAT_NAME = {"explorer": "资源管理器", "performance": "性能优化", "privacy": "隐私保护",
-            "update": "系统更新", "edge": "Edge 浏览器", "security": "安全防护",
-            "system": "系统偏好"}
-CAT_ICON = {"explorer": "📁", "performance": "⚡", "privacy": "🛡",
-            "update": "🔄", "edge": "🌐", "security": "🔒", "system": "⚙"}
+CAT_NAME = {"system": "系统", "personal": "个性化", "privacy": "隐私和安全性",
+            "security": "安全防护", "network": "网络和 Internet",
+            "update": "Windows 更新", "gaming": "游戏", "apps": "应用",
+            "explorer": "资源管理器", "input": "输入与键盘",
+            "performance": "性能优化", "edge": "Edge 浏览器"}
+CAT_ICON = {"system": "⚙", "personal": "🎨", "privacy": "🛡", "security": "🔒",
+            "network": "🌍", "update": "🔄", "gaming": "🎮", "apps": "📦",
+            "explorer": "📁", "input": "⌨", "performance": "⚡", "edge": "🌐"}
 
 
 # ==========================================================================
@@ -701,7 +707,47 @@ def notice(text, kind="info"):
     return lb
 
 
-def make_table(headers, stretch_first=True, wrap=True):
+class SortItem(QTableWidgetItem):
+    """支持数值排序的单元格：填充时把可解析的数字存进 UserRole+1。
+
+    "12.3 MB"、"30 ms"、"1,024 KB"、"97%"、"2025/6/1" 这类自带单位的值
+    都能按数值大小排，而不是按字符串排。
+    """
+
+    def __lt__(self, other):
+        a = self.data(Qt.UserRole + 1)
+        b = other.data(Qt.UserRole + 1)
+        if a is not None and b is not None:
+            return a < b
+        # 注意：不能调 super().__lt__()——PySide6 会递归回调本重载导致栈溢出
+        return self.text() < other.text()
+
+
+def _sort_num(v):
+    """从单元格文本里提取可排序的数值；不是数值型内容返回 None。"""
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).strip().replace(",", "")
+    if not s:
+        return None
+    # 纯数字 / 日期（2025/6/1、20260601）
+    if re.match(r"^[\d./:\-]+$", s):
+        digits = re.sub(r"\D", "", s)
+        return float(digits) if digits else None
+    # 数字 + 单位（12.3 MB / 30 ms / 97% / 1.5 GB）
+    m = re.match(r"^([0-9]+(?:\.[0-9]+)?)\s*(KB|MB|GB|TB|MB/s|KB/s|ms|%|个)?$",
+                 s, re.I)
+    if not m:
+        return None
+    val = float(m.group(1))
+    unit = (m.group(2) or "").upper()
+    val *= {"KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3, "TB": 1024 ** 4}.get(unit, 1)
+    return val
+
+
+def make_table(headers, stretch_first=True, wrap=True, sortable=False):
     t = QTableWidget(0, len(headers))
     t.setHorizontalHeaderLabels(headers)
     t.verticalHeader().setVisible(False)
@@ -716,18 +762,25 @@ def make_table(headers, stretch_first=True, wrap=True):
     if stretch_first:
         hh.setSectionResizeMode(0, QHeaderView.Stretch)
     t.horizontalHeader().setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+    t.setSortingEnabled(sortable)          # 点表头按列排序
     return t
 
 
 def fill_table(table, rows, tooltips=None):
+    was_sorted = table.isSortingEnabled()
+    if was_sorted:
+        table.setSortingEnabled(False)     # 填充期间必须关掉，否则行会乱跳
     table.setRowCount(0)
     for r in rows:
         i = table.rowCount()
         table.insertRow(i)
         tallest = 20
         for c, v in enumerate(r):
-            it = QTableWidgetItem("" if v is None else str(v))
+            it = SortItem("" if v is None else str(v))
             it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+            num = _sort_num(v)
+            if num is not None:
+                it.setData(Qt.UserRole + 1, num)
             it.setToolTip("" if v is None else str(v))   # 悬停可看全文
             table.setItem(i, c, it)
             tallest = max(tallest, it.sizeHint().height())
@@ -738,6 +791,8 @@ def fill_table(table, rows, tooltips=None):
                 it = table.item(i, c)
                 if it is not None:
                     it.setToolTip(str(tip))
+    if was_sorted:
+        table.setSortingEnabled(True)
 
 
 def btn(text, kind=None, on_click=None):
@@ -951,6 +1006,15 @@ class OverviewPage(Page):
         # GPU / 磁盘活动 / 网络 多设备详情
         dev_row = QHBoxLayout(); dev_row.setSpacing(12)
         gpu_card, gv = card("GPU 详情")
+        # GPU 选择：列出电脑里所有显卡（PDH GPU Engine + DirectX 注册表）
+        sel_row = QHBoxLayout()
+        sel_row.setSpacing(8)
+        sel_row.addWidget(QLabel("GPU："))
+        self.gpu_pick = QComboBox()
+        self.gpu_pick.addItem("全部")
+        self.gpu_pick.currentTextChanged.connect(self._on_gpu_pick)
+        sel_row.addWidget(self.gpu_pick, 1)
+        gv.addLayout(sel_row)
         self.gpu_box = QVBoxLayout(); self.gpu_box.setSpacing(8)
         gv.addLayout(self.gpu_box)
         dev_row.addWidget(gpu_card, 1)
@@ -986,6 +1050,15 @@ class OverviewPage(Page):
         self._net_tx = None
         self._last_gpu = None
         self._last_disk = None
+        self.gpu_sel = ""        # 当前选中的显卡名（"" = 全部）
+        self._gpu_sig = None     # 上次下拉框里的显卡名单，变了才重建
+        # 控件复用缓存：结构不变时只更新数值，避免每秒重建导致的闪烁
+        self._gpu_rows = []
+        self._gpu_rows_sig = None
+        self._disk_rows = []
+        self._disk_rows_sig = None
+        self._net_refs = None
+        self._net_sig = None
         # 1s：CPU / 内存（纯 ctypes，零开销）
         self.timer = QTimer(self)
         self.timer.setInterval(1000)
@@ -1005,6 +1078,10 @@ class OverviewPage(Page):
         self.tick_perf()
         self._load_net()
         self._update_legend()
+
+    def _on_gpu_pick(self, text):
+        """切换 GPU 详情里显示哪块显卡（空 = 全部）。"""
+        self.gpu_sel = "" if not text or text == "全部" else text
 
     def _update_legend(self):
         """曲线图例：颜色 + 名称，跟着主题走。"""
@@ -1057,30 +1134,37 @@ class OverviewPage(Page):
                 if it.widget():
                     it.widget().deleteLater()
 
-        def add_dev_bar(box, name, pct, obj_name):
+        def make_dev_bar(box, name, obj_name, pct_text="--"):
+            """创建一行设备占用条，返回引用供后续只改数值（不重建控件）。"""
             row = QWidget()
             rl = QHBoxLayout(row); rl.setContentsMargins(0, 0, 0, 0); rl.setSpacing(8)
             lb = QLabel(name); lb.setObjectName("Muted")
-            pb = QProgressBar(); pb.setRange(0, 100); pb.setValue(int(pct) if pct is not None else 0)
+            pb = QProgressBar(); pb.setRange(0, 100); pb.setValue(0)
             pb.setTextVisible(False); pb.setObjectName(obj_name)
-            rl.addWidget(lb, 0); rl.addWidget(pb, 1)
+            val = QLabel(pct_text)
+            val.setObjectName("Mono")
+            val.setMinimumWidth(52)
+            val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            rl.addWidget(lb, 0); rl.addWidget(pb, 1); rl.addWidget(val, 0)
             box.addWidget(row)
+            return {"row": row, "bar": pb, "val": val}
 
-        def add_disk_row(box, name, util, rd, wr):
-            """磁盘行：名称 + 利用率条 + 「读 x / 写 y MB/s」。"""
+        def make_disk_row(box, name):
+            """磁盘行：名称 + 利用率条 + 「读 x / 写 y MB/s」，同样复用。"""
             row = QWidget()
             rl = QVBoxLayout(row); rl.setContentsMargins(0, 0, 0, 0); rl.setSpacing(3)
             top = QHBoxLayout(); top.setContentsMargins(0, 0, 0, 0); top.setSpacing(8)
             lb = QLabel(name); lb.setObjectName("Muted")
             pb = QProgressBar(); pb.setRange(0, 100)
-            pb.setValue(int(util) if util is not None else 0)
+            pb.setValue(0)
             pb.setTextVisible(False); pb.setObjectName("Disk")
             top.addWidget(lb, 0); top.addWidget(pb, 1)
             rl.addLayout(top)
-            io = QLabel("读 %s   写 %s" % (fmt_mbps(rd), fmt_mbps(wr)))
+            io = QLabel("读 —   写 —")
             io.setObjectName("Mono")
             rl.addWidget(io)
             box.addWidget(row)
+            return {"row": row, "bar": pb, "io": io}
 
         def got(d):
             gpu_agg, disk_agg, ct, gt = d["gpu"], d["disk"], d["cpu_temp"], d["gpu_temp"]
@@ -1097,30 +1181,69 @@ class OverviewPage(Page):
             sub.setText("磁盘读写活跃时间占比")
             self.m_gpu.setText("GPU " + fmt_pct(gpu_agg))
 
-            # per-GPU bars
-            clear_box(self.gpu_box)
-            if d.get("gpus"):
-                for g in d["gpus"]:
-                    name = "GPU%d" % g["index"]
-                    if g.get("name"):
-                        name = g["name"]
-                    add_dev_bar(self.gpu_box, name, g.get("util"), "Gpu")
-                    if g.get("temp") is not None:
-                        add_dev_bar(self.gpu_box, "温度", g.get("temp"), "")
-                self.chart.gpu_on = True
-            else:
-                self.chart.gpu_on = False
+            # per-GPU bars：所有显卡 + 右侧具体百分比 + 按下拉选择过滤
+            # 关键：显卡名单不变时只更新数值，绝不重建控件（重建会闪）
+            gpus = d.get("gpus") or []
+            sig = "|".join(g.get("name") or ("GPU%d" % g.get("index", i))
+                           for i, g in enumerate(gpus))
+            if sig != self._gpu_sig:
+                self._gpu_sig = sig
+                self.gpu_pick.blockSignals(True)
+                self.gpu_pick.clear()
+                self.gpu_pick.addItem("全部")
+                for g in gpus:
+                    self.gpu_pick.addItem(g.get("name") or ("GPU%d" % g.get("index", 0)))
+                if self.gpu_sel:
+                    ix = self.gpu_pick.findText(self.gpu_sel)
+                    if ix >= 0:
+                        self.gpu_pick.setCurrentIndex(ix)
+                self.gpu_pick.blockSignals(False)
+            shown = [g for g in gpus
+                     if not self.gpu_sel or g.get("name") == self.gpu_sel]
+            spec = []
+            for g in shown:
+                spec.append(("u", g.get("name") or ("GPU%d" % g["index"]), g.get("util")))
+                if g.get("temp") is not None:
+                    spec.append(("t", g.get("name") or ("GPU%d" % g["index"]), g.get("temp")))
+            rsig = tuple((k, n) for k, n, _v in spec)
+            if rsig != self._gpu_rows_sig:
+                self._gpu_rows_sig = rsig
+                clear_box(self.gpu_box)
+                self._gpu_rows = []
+                for k, n, _v in spec:
+                    if k == "u":
+                        self._gpu_rows.append(make_dev_bar(self.gpu_box, n, "Gpu"))
+                    else:
+                        self._gpu_rows.append(make_dev_bar(self.gpu_box, "温度", ""))
+                if not spec:
+                    empty = QLabel("未检测到可显示的 GPU")
+                    empty.setObjectName("Muted")
+                    self.gpu_box.addWidget(empty)
+            for ref, (k, _n, v) in zip(self._gpu_rows, spec):
+                ref["bar"].setValue(int(v) if v is not None else 0)
+                if k == "u":
+                    _cls(ref["bar"], v, "Gpu")
+                    ref["val"].setText("--" if v is None else "%d%%" % round(v))
+                else:
+                    restyle(ref["bar"], "")
+                    ref["val"].setText("--" if v is None else "%d°C" % round(v))
+            self.chart.gpu_on = bool(spec)
 
-            # per-disk activity bars（含读写速率）
-            clear_box(self.diskact_box)
-            if d.get("disks"):
-                for i, disk in enumerate(d["disks"]):
-                    name = disk.get("name") or "Disk%d" % i
-                    add_disk_row(self.diskact_box, name, disk.get("util"),
-                                 disk.get("read_mbps"), disk.get("write_mbps"))
-                self.chart.disk_on = True
-            else:
-                self.chart.disk_on = False
+            # per-disk activity bars（含读写速率）—— 同样复用控件
+            disks = d.get("disks") or []
+            dsig = tuple(dk.get("name") or "Disk%d" % i for i, dk in enumerate(disks))
+            if dsig != self._disk_rows_sig:
+                self._disk_rows_sig = dsig
+                clear_box(self.diskact_box)
+                self._disk_rows = [make_disk_row(self.diskact_box, dk.get("name") or "磁盘%d" % i)
+                                   for i, dk in enumerate(disks)]
+            for ref, dk in zip(self._disk_rows, disks):
+                u = dk.get("util")
+                ref["bar"].setValue(int(u) if u is not None else 0)
+                _cls(ref["bar"], u, "Disk")
+                ref["io"].setText("读 %s   写 %s" % (fmt_mbps(dk.get("read_mbps")),
+                                                   fmt_mbps(dk.get("write_mbps"))))
+            self.chart.disk_on = bool(disks)
 
             # 网络：网卡类型 / 协商速率 / 实时收发
             self._render_net(d)
@@ -1131,24 +1254,18 @@ class OverviewPage(Page):
 
             self.temp_cpu.setText("CPU 温度：%s" % fmt_temp(ct))
             if ct is not None and ct >= 85:
-                self.temp_cpu.setObjectName("PillErr")
+                restyle(self.temp_cpu, "PillErr")
             elif ct is not None and ct >= 70:
-                self.temp_cpu.setObjectName("PillWarn")
+                restyle(self.temp_cpu, "PillWarn")
             else:
-                self.temp_cpu.setObjectName("PillBlue")
-            self.temp_cpu.style().unpolish(self.temp_cpu)
-            self.temp_cpu.style().polish(self.temp_cpu)
-            fit_label(self.temp_cpu)
+                restyle(self.temp_cpu, "PillBlue")
             self.temp_gpu.setText("GPU 温度：%s" % fmt_temp(gt))
             if gt is not None and gt >= 85:
-                self.temp_gpu.setObjectName("PillErr")
+                restyle(self.temp_gpu, "PillErr")
             elif gt is not None and gt >= 75:
-                self.temp_gpu.setObjectName("PillWarn")
+                restyle(self.temp_gpu, "PillWarn")
             else:
-                self.temp_gpu.setObjectName("PillBlue")
-            self.temp_gpu.style().unpolish(self.temp_gpu)
-            self.temp_gpu.style().polish(self.temp_gpu)
-            fit_label(self.temp_gpu)
+                restyle(self.temp_gpu, "PillBlue")
             if ct is None and gt is None:
                 self.temp_note.setText("这台机器的 CPU/GPU 温度传感器对 WMI 不可见。"
                                        "N 卡可装最新驱动后重试（nvidia-smi），或用 HWiNFO 查看。")
@@ -1233,63 +1350,88 @@ class OverviewPage(Page):
         Tasks.run(self, S.net_info, got_net, on_fail=lambda *_: None)
 
     def _render_net(self, _unused=None):
+        """网络卡片：结构不变时只刷新数值，避免每秒重建控件导致的闪烁。"""
         d = getattr(self, "_net", None) or {}
         box = getattr(self, "net_box", None)
         if box is None:
             return
-        while box.count():
-            it = box.takeAt(0)
-            if it.widget():
-                it.widget().deleteLater()
-
         prim = d.get("primary")
-        if not prim:
-            lb = QLabel("未检测到活动网卡"); lb.setObjectName("Muted")
-            box.addWidget(lb)
+        link = (prim or {}).get("link_mbps") or d.get("speed_mbps")
+        sig = (None if not prim else
+               (prim.get("name"), prim.get("kind"), prim.get("desc") or "",
+                bool(link), bool(prim.get("desc"))))
+        if sig != self._net_sig:
+            self._net_sig = sig
+            while box.count():
+                it = box.takeAt(0)
+                if it.widget():
+                    it.widget().deleteLater()
+            self._net_refs = None
+            if not prim:
+                lb = QLabel("未检测到活动网卡"); lb.setObjectName("Muted")
+                box.addWidget(lb)
+                return
+            # 第一行：类型标签 + 网卡名
+            h1 = QHBoxLayout(); h1.setSpacing(8)
+            kind = prim.get("kind") or "网络"
+            icon = "📶" if kind == "WiFi" else "🔌"
+            tag = QLabel("%s %s" % (icon, kind))
+            tag.setObjectName("PillBlue")
+            tag.setMinimumHeight(22)
+            nm = QLabel(prim.get("name") or "—"); nm.setObjectName("Muted")
+            nm.setWordWrap(True)
+            h1.addWidget(tag, 0); h1.addWidget(nm, 1)
+            w1 = QWidget(); w1.setLayout(h1); box.addWidget(w1)
+
+            ls = QLabel("协商速率：%s" % fmt_linkspeed(link))
+            ls.setObjectName("Mono"); ls.setWordWrap(True)
+            box.addWidget(ls)
+
+            io = QLabel("↓ 下载 —    ↑ 上传 —")
+            io.setObjectName("Mono"); io.setWordWrap(True)
+            box.addWidget(io)
+
+            bar = None
+            if link:
+                row = QWidget()
+                rl = QHBoxLayout(row); rl.setContentsMargins(0, 0, 0, 0); rl.setSpacing(8)
+                lb2 = QLabel("带宽占用"); lb2.setObjectName("Muted")
+                bar = QProgressBar(); bar.setRange(0, 100); bar.setValue(0)
+                bar.setTextVisible(False); bar.setObjectName("Net")
+                rl.addWidget(lb2, 0); rl.addWidget(bar, 1)
+                box.addWidget(row)
+
+            if prim.get("desc"):
+                de = QLabel(prim["desc"]); de.setObjectName("Muted3")
+                de.setWordWrap(True)
+                box.addWidget(de)
+            box.addStretch(0)
+            self._net_refs = {"io": io, "bar": bar}
+            fit_labels(box)
+
+        refs = self._net_refs
+        if not refs:
             return
-
-        # 第一行：类型标签 + 网卡名
-        h1 = QHBoxLayout(); h1.setSpacing(8)
-        kind = prim.get("kind") or "网络"
-        icon = "📶" if kind == "WiFi" else "🔌"
-        tag = QLabel("%s %s" % (icon, kind))
-        tag.setObjectName("PillBlue")
-        tag.setMinimumHeight(22)
-        nm = QLabel(prim.get("name") or "—"); nm.setObjectName("Muted")
-        nm.setWordWrap(True)
-        h1.addWidget(tag, 0); h1.addWidget(nm, 1)
-        w1 = QWidget(); w1.setLayout(h1); box.addWidget(w1)
-
-        # 第二行：协商速率
-        link = prim.get("link_mbps") or d.get("speed_mbps")
-        ls = QLabel("协商速率：%s" % fmt_linkspeed(link))
-        ls.setObjectName("Mono"); ls.setWordWrap(True)
-        box.addWidget(ls)
-
-        # 第三行：实时收发 + 带宽占用条（相对协商速率）
         rx = d.get("rx_mbps") or 0.0
         tx = d.get("tx_mbps") or 0.0
-        io = QLabel("↓ 下载 %s    ↑ 上传 %s"
-                    % (fmt_rate(d.get("rx_mbps")), fmt_rate(d.get("tx_mbps"))))
-        io.setObjectName("Mono"); io.setWordWrap(True)
-        box.addWidget(io)
-
-        if link:
+        refs["io"].setText("↓ 下载 %s    ↑ 上传 %s"
+                           % (fmt_rate(d.get("rx_mbps")), fmt_rate(d.get("tx_mbps"))))
+        if refs.get("bar") is not None:
             pct = min(100, int(round((rx + tx) * 100.0 / max(1.0, float(link)))))
-            row = QWidget()
-            rl = QHBoxLayout(row); rl.setContentsMargins(0, 0, 0, 0); rl.setSpacing(8)
-            lb = QLabel("带宽占用"); lb.setObjectName("Muted")
-            pb = QProgressBar(); pb.setRange(0, 100); pb.setValue(pct)
-            pb.setTextVisible(False); pb.setObjectName("Net")
-            rl.addWidget(lb, 0); rl.addWidget(pb, 1)
-            box.addWidget(row)
+            refs["bar"].setValue(pct)
 
-        if prim.get("desc"):
-            de = QLabel(prim["desc"]); de.setObjectName("Muted3")
-            de.setWordWrap(True)
-            box.addWidget(de)
 
-        fit_labels(box)
+def restyle(w, obj_name):
+    """只在 objectName 真的变化时才 unpolish/polish。
+
+    旧版每秒都无条件重刷样式，会让整行控件重绘 —— 页面刷新时"闪一下"的主因之一。
+    """
+    if getattr(w, "_wt_style_name", None) == obj_name:
+        return
+    w._wt_style_name = obj_name
+    w.setObjectName(obj_name)
+    w.style().unpolish(w)
+    w.style().polish(w)
 
 
 def _cls(bar, v, base=""):
@@ -1299,9 +1441,7 @@ def _cls(bar, v, base=""):
         nm = "Warn"
     else:
         nm = base
-    bar.setObjectName(nm)
-    bar.style().unpolish(bar)
-    bar.style().polish(bar)
+    restyle(bar, nm)
 
 
 def _set(card_tuple, val_text, sub_text, size=None):
@@ -1519,19 +1659,13 @@ class OptimizePage(Page):
     def refresh(self):
         def got(rules):
             self.rules = rules
-            saved = self.win.settings.get("optimize_sel", {})
-            self.sel = {k: bool(v) for k, v in saved.items()}
-            # 预读取：读取系统当前注册表值，若某规则已与优化目标一致且用户未明确取消，则自动勾选
-            auto_checked = 0
-            for r in rules:
-                if r.get("state") is True and r["id"] not in saved:
-                    self.sel[r["id"]] = True
-                    auto_checked += 1
-            if auto_checked:
-                self.lb_preread.setText(
-                    "预读取完成：检测到系统已有 %d 项与优化目标一致，已自动勾选（可在具体分类里取消）。" % auto_checked)
-            else:
-                self.lb_preread.setText("预读取完成：未检测到已生效的优化项。")
+            # 只读预读取：仅统计系统当前值与优化目标一致的项数用于展示。
+            # 绝不自动勾选、绝不写任何系统设置——软件打开时一切保持原样，
+            # 勾选完全由用户手动进行（也不再持久化上次的勾选）。
+            done = len([r for r in rules if r.get("state") is True])
+            self.lb_preread.setText(
+                "只读检测完成：当前有 %d 项的系统值与优化目标一致（仅为状态显示，"
+                "本软件打开时未修改任何设置；所有项默认不勾选，由你手动选择）。" % done)
             self._update_safe_hint()
             self.build_root()
         Tasks.run(self, S.load_rules_with_state, got)
@@ -1606,7 +1740,8 @@ class OptimizePage(Page):
         self.save_state()
 
     def save_state(self):
-        self.win.settings["optimize_sel"] = self.sel
+        # 不再持久化勾选：每次启动全部不勾选，杜绝"上次勾选静默恢复后被一键应用"
+        self.win.settings.pop("optimize_sel", None)
 
     # ---------- 大类列表 ----------
     def build_root(self):
@@ -1738,10 +1873,10 @@ class OptimizePage(Page):
             return
         pol = len([r for r in self.rules if r.get("risk") == "policy"])
         if pol:
-            lb.setText("把所有优化项直接列出来，手动勾选你要改的项即可；"
-                       "其中 %d 项标有【策略】。勾选状态会自动保存。" % pol)
+            lb.setText("打开软件不会改动任何系统设置；手动勾选你要改的项再点“应用所选”才会生效，"
+                       "其中 %d 项标有【策略】。" % pol)
         else:
-            lb.setText("把所有优化项直接列出来，手动勾选你要改的项即可；勾选状态会自动保存。")
+            lb.setText("打开软件不会改动任何系统设置；手动勾选你要改的项再点“应用所选”才会生效。")
 
     def clear_sel(self):
         self.sel = {}
@@ -1946,16 +2081,19 @@ class SecurityPage(Page):
 class SoftwarePage(Page):
     title = "软件管理"
 
+    SORTS = [("名称", "name"), ("大小", "size"), ("安装日期", "date")]
+
     def __init__(self, win):
         super().__init__(win)
         self.all = []
+        self._icons = {}
         root = QVBoxLayout(self)
         root.setContentsMargins(20, 18, 20, 18)
         root.setSpacing(12)
 
         bar = QHBoxLayout()
         self.q = QLineEdit(); self.q.setPlaceholderText("搜索程序名 / 发布者")
-        self.q.setMaximumWidth(280)
+        self.q.setMaximumWidth(260)
         self.q.textChanged.connect(self.filter)
         self.n = pill("共 0 个", "")
         bar.addWidget(self.q)
@@ -1965,7 +2103,22 @@ class SoftwarePage(Page):
         bar.addWidget(btn("刷新", on_click=self.refresh))
         root.addLayout(bar)
 
-        self.table = make_table(["程序名", "发布者", "版本", "大小", "安装日期"])
+        bar2 = QHBoxLayout()
+        bar2.addWidget(QLabel("排序："))
+        self.sort_combo = QComboBox()
+        for label, key in self.SORTS:
+            self.sort_combo.addItem(label, key)
+        self.sort_combo.setCurrentIndex(0)
+        self.sort_combo.currentIndexChanged.connect(self.filter)
+        bar2.addWidget(self.sort_combo)
+        self.sort_desc = True
+        self.btn_order = btn("降序", on_click=self.toggle_order)
+        bar2.addWidget(self.btn_order)
+        bar2.addStretch(1)
+        root.addLayout(bar2)
+
+        self.table = make_table(["程序名", "发布者", "版本", "大小", "安装日期"],
+                                sortable=True)
         root.addWidget(self.table, 1)
 
         act = QHBoxLayout()
@@ -1985,22 +2138,90 @@ class SoftwarePage(Page):
         self.all = lst
         self.filter()
 
+    def _icon(self, it):
+        """从 DisplayIcon 提取程序图标（QFileIconProvider 走系统外壳，带缓存）。"""
+        name = it["name"]
+        if name in self._icons:
+            return self._icons[name]
+        from PySide6.QtWidgets import QFileIconProvider
+        icon = QFileIconProvider().icon(QFileIconProvider.File)
+        raw = (it.get("icon") or "").strip()
+        if raw:
+            path = raw.split('",')[0].strip('"').strip()
+            if "," in path:
+                path = path.rsplit(",", 1)[0].strip().strip('"')
+            if path and os.path.exists(path):
+                try:
+                    if path.lower().endswith(".ico"):
+                        icon = QIcon(path)
+                    else:
+                        icon = QFileIconProvider().icon(QFileInfo(path))
+                except Exception:
+                    pass
+        self._icons[name] = icon
+        return icon
+
+    def _date_key(self, s):
+        d = "".join(ch for ch in (s or "") if ch.isdigit())
+        return int(d) if d else 0
+
+    def toggle_order(self):
+        self.sort_desc = not self.sort_desc
+        self.btn_order.setText("降序" if self.sort_desc else "升序")
+        self.filter()
+
     def filter(self):
         kw = self.q.text().strip().lower()
         rows = [x for x in self.all
                 if not kw or kw in (x["name"] + " " + (x["publisher"] or "")).lower()]
+        key = self.sort_combo.currentData() or "name"
+        if key == "size":
+            rows.sort(key=lambda x: x["size"] or 0, reverse=self.sort_desc)
+        elif key == "date":
+            rows.sort(key=lambda x: self._date_key(x["date"]), reverse=self.sort_desc)
+        else:
+            rows.sort(key=lambda x: x["name"].lower(), reverse=self.sort_desc)
         self.n.setText("共 %d 个" % len(rows))
-        fill_table(self.table, [[x["name"], x["publisher"], x["version"],
-                                 fmt_bytes(x["size"] * 1024) if x["size"] else "",
-                                 x["date"]] for x in rows])
-        self.table.setColumnWidth(0, 320)
+        was_sorted = self.table.isSortingEnabled()
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(0)
+        for idx, x in enumerate(rows):
+            i = self.table.rowCount()
+            self.table.insertRow(i)
+            it0 = SortItem(x["name"])
+            it0.setFlags(it0.flags() & ~Qt.ItemIsEditable)
+            it0.setIcon(self._icon(x))
+            it0.setToolTip(x["name"])
+            it0.setData(Qt.UserRole, idx)      # 记住原始行号，排序后仍能对上数据
+            self.table.setItem(i, 0, it0)
+            for c, v in enumerate([x["publisher"], x["version"],
+                                   fmt_bytes(x["size"] * 1024) if x["size"] else "",
+                                   x["date"]], start=1):
+                it = SortItem("" if v is None else str(v))
+                it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+                num = _sort_num(v)
+                if num is not None:
+                    it.setData(Qt.UserRole + 1, num)
+                it.setToolTip("" if v is None else str(v))
+                self.table.setItem(i, c, it)
+            self.table.setRowHeight(i, 30)
+        if was_sorted:
+            self.table.setSortingEnabled(True)
+        self.table.setColumnWidth(0, 300)
         self._rows = rows
 
     def _current(self):
         r = self.table.currentRow()
-        if r < 0 or r >= len(getattr(self, "_rows", [])):
+        if r < 0 or r >= self.table.rowCount():
             return None
-        return self._rows[r]
+        it = self.table.item(r, 0)
+        idx = it.data(Qt.UserRole) if it else None
+        if idx is None:
+            idx = r
+        rows = getattr(self, "_rows", [])
+        if idx < 0 or idx >= len(rows):
+            return None
+        return rows[idx]
 
     def uninstall(self):
         if not self.win.admin_mode:
@@ -2020,33 +2241,473 @@ class SoftwarePage(Page):
             if cmd.lower().startswith("msiexec"):
                 return S.run(["cmd", "/c", cmd + " /qn /norestart"], timeout=600)[1][:300]
             return S.run(["cmd", "/c", "start", "", cmd], timeout=60)[1][:300]
+
+        def done(_r):
+            self.info_lb.setText("卸载命令已执行")
+            if confirm(self, "残留扫描",
+                       "卸载程序已运行。\n\n是否现在扫描 %s 留下的残余文件与注册表项？"
+                       "\n（扫描只列出结果，删除前会再让你逐项勾选）" % it["name"]):
+                self._scan_residual(it)
+
         self.info_lb.setText("已启动卸载程序…")
-        Tasks.run(self, do, lambda r: self.info_lb.setText("卸载命令已执行"))
+        Tasks.run(self, do, done)
+
+    def _scan_residual(self, it):
+        self.win.busy("正在扫描残留…")
+        Tasks.run(self,
+                  lambda: S.residual_scan(it["name"], it.get("publisher") or "",
+                                          it.get("location") or ""),
+                  lambda r: (self.win.idle(), ResidualDialog(self, it["name"], r,
+                                                             on_done=self.refresh).exec())[1],
+                  on_fail=lambda m: (self.win.idle(), warn(self, "扫描失败：" + m))[1])
 
     def leftover(self):
         from PySide6.QtWidgets import QInputDialog
         kw, ok = QInputDialog.getText(self, "残留扫描", "输入已卸载程序的关键词（≥3 字符）：")
         if not ok or len(kw.strip()) < 3:
             return
+        self.win.busy("正在扫描残留…")
+        Tasks.run(self,
+                  lambda: S.residual_scan(kw.strip(), "", ""),
+                  lambda r: (self.win.idle(),
+                             ResidualDialog(self, kw.strip(), r, on_done=self.refresh).exec())[1],
+                  on_fail=lambda m: (self.win.idle(), warn(self, "扫描失败：" + m))[1])
 
-        def do():
-            found = []
-            for base in [os.environ.get("PROGRAMFILES", ""), os.environ.get("PROGRAMFILES(X86)", ""),
-                         os.environ.get("PROGRAMDATA", ""), os.environ.get("LOCALAPPDATA", ""),
-                         os.environ.get("APPDATA", "")]:
-                if not base or not os.path.isdir(base):
-                    continue
-                try:
-                    for entry in os.listdir(base):
-                        if kw.strip().lower() in entry.lower():
-                            full = os.path.join(base, entry)
-                            sz = S.dir_size(full, cap=20000)[0] if os.path.isdir(full) else 0
-                            found.append([full, fmt_bytes(sz), "目录" if os.path.isdir(full) else "文件"])
-                except OSError:
-                    pass
-            return found
-        Tasks.run(self, do, lambda r: (fill_table(self.table, r) if r else
-                                       info(self, "未发现残留目录")))
+
+class ResidualDialog(QDialog):
+    """卸载残留结果：逐项勾选后删除。"""
+
+    def __init__(self, parent, name, result, on_done=None):
+        super().__init__(parent)
+        self.setWindowTitle("残留扫描 — %s" % name)
+        self.resize(760, 560)
+        self.on_done = on_done
+        result = result or {}
+        files = result.get("files") or []
+        regs = result.get("reg") or []
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 14, 16, 14)
+        root.setSpacing(10)
+
+        head = QLabel("找到 %d 个文件/目录、%d 个注册表项。\n勾选要删除的项（已全选），确认后点下方按钮。"
+                      % (len(files), len(regs)))
+        head.setObjectName("Muted")
+        head.setWordWrap(True)
+        root.addWidget(head)
+
+        root.addWidget(QLabel("残留文件 / 目录"))
+        self.tbl_files = make_table(["", "路径", "类型", "大小"])
+        for f in files:
+            i = self.tbl_files.rowCount()
+            self.tbl_files.insertRow(i)
+            chk = QTableWidgetItem()
+            chk.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+            chk.setCheckState(Qt.Checked)
+            self.tbl_files.setItem(i, 0, chk)
+            for c, v in enumerate([f["path"],
+                                   "目录" if f["kind"] == "dir" else "文件",
+                                   fmt_bytes(f.get("bytes") or 0)], start=1):
+                it = QTableWidgetItem(str(v))
+                it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+                it.setToolTip(str(v))
+                self.tbl_files.setItem(i, c, it)
+        self.tbl_files.setColumnWidth(0, 34)
+        self.tbl_files.setColumnWidth(1, 420)
+        root.addWidget(self.tbl_files, 1)
+
+        root.addWidget(QLabel("残留注册表项"))
+        self.tbl_reg = make_table(["", "位置"])
+        for rg in regs:
+            i = self.tbl_reg.rowCount()
+            self.tbl_reg.insertRow(i)
+            chk = QTableWidgetItem()
+            chk.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+            chk.setCheckState(Qt.Checked)
+            self.tbl_reg.setItem(i, 0, chk)
+            it = QTableWidgetItem("%s\\%s" % (rg["hive"], rg["path"]))
+            it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+            it.setToolTip("%s\\%s" % (rg["hive"], rg["path"]))
+            self.tbl_reg.setItem(i, 1, it)
+        self.tbl_reg.setColumnWidth(0, 34)
+        self.tbl_reg.setColumnWidth(1, 560)
+        root.addWidget(self.tbl_reg, 1)
+
+        hb = QHBoxLayout()
+        self.btn_del = btn("删除勾选项", "Danger", on_click=self._clean)
+        self.btn_del.setEnabled(bool(files or regs))
+        hb.addWidget(self.btn_del)
+        hb.addWidget(btn("全不选", on_click=lambda: self._check_all(False)))
+        hb.addWidget(btn("全选", on_click=lambda: self._check_all(True)))
+        hb.addStretch(1)
+        hb.addWidget(btn("关闭", on_click=self.reject))
+        root.addLayout(hb)
+        self._result = None
+
+    def _check_all(self, on):
+        state = Qt.Checked if on else Qt.Unchecked
+        for t in (self.tbl_files, self.tbl_reg):
+            for r in range(t.rowCount()):
+                t.item(r, 0).setCheckState(state)
+
+    def _collect(self, table, n_extra):
+        out = []
+        for r in range(table.rowCount()):
+            if table.item(r, 0).checkState() == Qt.Checked:
+                if n_extra == 2:      # files 表：路径列在 1
+                    kind = table.item(r, 2).text()
+                    out.append({"path": table.item(r, 1).text(),
+                                "kind": "dir" if kind == "目录" else "file"})
+                else:                 # reg 表：hive\path 在 1
+                    full = table.item(r, 1).text()
+                    hive, _, path = full.partition("\\")
+                    out.append({"hive": hive, "path": path})
+        return out
+
+    def _clean(self):
+        files = self._collect(self.tbl_files, 2)
+        regs = self._collect(self.tbl_reg, 1)
+        if not files and not regs:
+            return info(self, "没有勾选任何项。")
+        if not confirm(self, "确认删除",
+                       "即将删除 %d 个文件/目录 和 %d 个注册表项。\n\n此操作不可撤销，请确认没有勾错。" %
+                       (len(files), len(regs)), danger=True):
+            return
+        self.btn_del.setEnabled(False)
+        Tasks.run(self, lambda: S.residual_clean(files, regs), self._cleaned,
+                  on_fail=lambda m: (self._enable(), warn(self, "删除失败：" + m)))
+
+    def _enable(self):
+        self.btn_del.setEnabled(True)
+
+    def _cleaned(self, r):
+        self._enable()
+        ok = (r or {}).get("ok")
+        msgs = (r or {}).get("msg") or []
+        QMessageBox.information(self, "清理完成" if ok else "清理完成（部分失败）",
+                                "\n".join(msgs[:30]) or "完成")
+        if self.on_done:
+            self.on_done()
+        self.accept()
+
+
+# ==========================================================================
+# 5.5 CPU 调试（大小核调度 / 电源 / EPP / 进程亲和）
+# ==========================================================================
+class CpuTunePage(Page):
+    title = "CPU 调试"
+
+    def __init__(self, win):
+        super().__init__(win)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 18, 20, 18)
+        root.setSpacing(12)
+
+        self.topo = None
+        self._core_cells = {}
+
+        # ---- 1. 实时状态 ----
+        f1, v1 = card("CPU 实时状态")
+        self.lb_name = QLabel("读取中…"); self.lb_name.setObjectName("Muted")
+        self.lb_name.setWordWrap(True)
+        self.pill_temp = pill("温度 —", "blue")
+        row0 = QHBoxLayout()
+        row0.addWidget(self.lb_name, 1)
+        row0.addWidget(self.pill_temp)
+        v1.addLayout(row0)
+        self.core_grid = QGridLayout()
+        self.core_grid.setSpacing(6)
+        v1.addLayout(self.core_grid)
+        root.addWidget(f1)
+
+        # ---- 2. 调度控制 ----
+        f2, v2 = card("调度控制（当前电源计划）")
+        r1 = QHBoxLayout()
+        r1.addWidget(QLabel("电源计划："))
+        self.plan_combo = QComboBox()
+        self.plan_combo.currentIndexChanged.connect(self.on_plan_selected)
+        r1.addWidget(self.plan_combo, 1)
+        self.btn_plan = btn("切换", "Primary", on_click=self.apply_plan)
+        r1.addWidget(self.btn_plan)
+        v2.addLayout(r1)
+        self.lb_plan_state = QLabel("")
+        self.lb_plan_state.setObjectName("Muted")
+        v2.addWidget(self.lb_plan_state)
+
+        r2 = QHBoxLayout()
+        r2.addWidget(QLabel("处理器最小状态 %："))
+        self.spin_min = QSpinBox(); self.spin_min.setRange(0, 100)
+        r2.addWidget(self.spin_min)
+        r2.addWidget(QLabel("最大状态 %："))
+        self.spin_max = QSpinBox(); self.spin_max.setRange(0, 100)
+        r2.addWidget(self.spin_max)
+        self.btn_states = btn("应用", "Primary", on_click=self.apply_states)
+        r2.addWidget(self.btn_states)
+        r2.addStretch(1)
+        v2.addLayout(r2)
+
+        r3 = QHBoxLayout()
+        r3.addWidget(QLabel("能效偏好 EPP（0=最高性能，100=最省电）："))
+        self.slider_epp = QSlider(Qt.Horizontal)
+        self.slider_epp.setRange(0, 100)
+        self.lb_epp = QLabel("—"); self.lb_epp.setObjectName("Mono")
+        self.slider_epp.valueChanged.connect(lambda v: self.lb_epp.setText(str(v)))
+        r3.addWidget(self.slider_epp, 1)
+        r3.addWidget(self.lb_epp)
+        self.btn_epp = btn("应用", "Primary", on_click=self.apply_epp)
+        r3.addWidget(self.btn_epp)
+        v2.addLayout(r3)
+        root.addWidget(f2)
+
+        # ---- 3. 大小核调度 ----
+        f3, v3 = card("大小核调度（Intel 混合架构）")
+        self.lb_topo = QLabel("读取中…"); self.lb_topo.setObjectName("Muted")
+        self.lb_topo.setWordWrap(True)
+        v3.addWidget(self.lb_topo)
+        r4 = QHBoxLayout()
+        r4.addWidget(QLabel("进程："))
+        self.proc_combo = QComboBox()
+        self.proc_combo.setMinimumWidth(260)
+        r4.addWidget(self.proc_combo, 1)
+        r4.addWidget(btn("绑到 P 核", on_click=lambda: self.set_affinity("P")))
+        r4.addWidget(btn("绑到 E 核", on_click=lambda: self.set_affinity("E")))
+        r4.addWidget(btn("全核", on_click=lambda: self.set_affinity("ALL")))
+        self.btn_procs = btn("刷新进程", on_click=self.load_procs)
+        r4.addWidget(self.btn_procs)
+        v3.addLayout(r4)
+        self.lb_aff = QLabel(""); self.lb_aff.setObjectName("Muted")
+        self.lb_aff.setWordWrap(True)
+        v3.addWidget(self.lb_aff)
+        root.addWidget(f3)
+
+        # ---- 4. E-core 全局开关 ----
+        f4, v4 = card("E-core 全局开关（高级）")
+        v4.addWidget(notice(
+            "通过 bcdedit numproc 让 Windows 只使用 P 核，需重启生效。\n"
+            "风险：个别驱动/授权校验依赖完整核心数；恢复同样在这里点“恢复全部核心”。", "warn"))
+        self.lb_ecore = QLabel("当前：读取中…")
+        r5 = QHBoxLayout()
+        r5.addWidget(self.lb_ecore, 1)
+        r5.addWidget(btn("禁用 E-core（重启生效）", "Danger", on_click=self.ecore_off))
+        r5.addWidget(btn("恢复全部核心", on_click=self.ecore_on))
+        v4.addLayout(r5)
+        root.addWidget(f4)
+
+        root.addStretch(1)
+
+        # ---- 定时器 ----
+        self.timer = QTimer(self)
+        self.timer.setInterval(1000)
+        self.timer.timeout.connect(self.tick)
+        self.timer.start()
+
+    # ---------- 生命周期 ----------
+    def refresh(self):
+        if self.topo is None:
+            Tasks.run(self, S.cpu_topology, self._got_topo)
+        Tasks.run(self, S.cpu_plans, self._got_plans, on_fail=lambda *_: None)
+        Tasks.run(self, S.cpu_proc_states, self._got_states, on_fail=lambda *_: None)
+        Tasks.run(self, S.ecore_status, self._got_ecore, on_fail=lambda *_: None)
+        self.load_procs()
+
+    def on_exit(self):
+        pass
+
+    # ---------- 拓扑 / 渲染 ----------
+    def _got_topo(self, t):
+        self._topo_loading = False
+        self.topo = t
+        if not t:
+            self.lb_name.setText("无法读取 CPU 拓扑")
+            return
+        self.lb_name.setText("%s  ·  %d 逻辑处理器（P 核 %d / E 核 %d）  ·  基频 %d MHz"
+                             % (t["name"], t["logical"], t["p_cores"], t["e_cores"],
+                                t["base_mhz"]))
+        pset = set(t["p_logicals"])
+        # 每逻辑处理器一个小单元：P 核绿框、E 核灰框
+        while self.core_grid.count():
+            it = self.core_grid.takeAt(0)
+            if it.widget():
+                it.widget().deleteLater()
+        self._core_cells = {}
+        for i in range(t["logical"]):
+            f = QFrame(); f.setObjectName("CatCard")
+            fl = QVBoxLayout(f); fl.setContentsMargins(8, 6, 8, 6); fl.setSpacing(2)
+            tag = "P" if i in pset else "E"
+            lb = QLabel("%s%d" % (tag, i)); lb.setObjectName("Muted")
+            bar = QProgressBar(); bar.setRange(0, 100); bar.setValue(0)
+            bar.setTextVisible(False)
+            bar.setObjectName("Gpu" if tag == "P" else "Disk")
+            val = QLabel("—"); val.setObjectName("Mono")
+            fl.addWidget(lb); fl.addWidget(bar); fl.addWidget(val)
+            self.core_grid.addWidget(f, i // 4, i % 4)
+            self._core_cells[i] = (bar, val)
+
+    def tick(self):
+        if not self.isVisible():
+            return
+        if self.topo is None and not getattr(self, "_topo_loading", False):
+            self._topo_loading = True
+            Tasks.run(self, S.cpu_topology, self._got_topo,
+                      on_fail=lambda *_: setattr(self, "_topo_loading", False))
+        Tasks.run(self, S.cpu_per_core, self._got_core, on_fail=lambda *_: None)
+        Tasks.run(self, S.cpu_temp, lambda v: self.pill_temp.setText(
+            "温度 %s" % fmt_temp(v)), on_fail=lambda *_: None)
+
+    def _got_core(self, d):
+        if not d:
+            return
+        for c in d.get("cores", []):
+            cell = self._core_cells.get(c["id"])
+            if not cell:
+                continue
+            bar, val = cell
+            u = c.get("util")
+            m = c.get("mhz")
+            bar.setValue(int(u or 0))
+            val.setText("%d%% · %s" % (round(u or 0),
+                                       ("%dMHz" % round(m)) if m else "—"))
+
+    # ---------- 调度控制 ----------
+    def _got_plans(self, plans):
+        self._plans = plans or []
+        cur = self.plan_combo.currentData()
+        self.plan_combo.blockSignals(True)
+        self.plan_combo.clear()
+        for p in self._plans:
+            label = p["name"] or p["guid"]
+            if p.get("active"):
+                label += "（当前生效）"
+            self.plan_combo.addItem(label, p["guid"])
+        if cur:
+            ix = self.plan_combo.findData(cur)
+            self.plan_combo.setCurrentIndex(ix if ix >= 0 else 0)
+        self.plan_combo.blockSignals(False)
+        self.on_plan_selected()          # 选定计划后立即读取它的参数
+
+    def on_plan_selected(self):
+        """切换下拉时读取该计划存储的处理器参数（含未生效的计划）。"""
+        guid = self.plan_combo.currentData()
+        active = next((p for p in getattr(self, "_plans", []) if p.get("active")), None)
+        if active and guid == active.get("guid"):
+            self.lb_plan_state.setText("该计划当前生效，修改参数立即生效。")
+        else:
+            self.lb_plan_state.setText("该计划未生效：显示的是它保存的参数，"
+                                       "点“应用”写入后，切换到它时生效。")
+        if not guid:
+            return
+        Tasks.run(self, lambda: S.cpu_proc_states(guid), self._got_states,
+                  on_fail=lambda *_: None)
+
+    def apply_plan(self):
+        guid = self.plan_combo.currentData()
+        if not guid:
+            return
+        r = S.cpu_set_plan(guid)
+        if r.get("ok"):
+            self.refresh()
+            info(self, "电源计划已切换。")
+        else:
+            warn(self, "切换失败：%s" % r.get("err"))
+
+    def _got_states(self, st):
+        if not st:
+            return
+        if st.get("min") is not None:
+            self.spin_min.setValue(int(st["min"]))
+        if st.get("max") is not None:
+            self.spin_max.setValue(int(st["max"]))
+        if st.get("epp") is not None:
+            self.slider_epp.setValue(int(st["epp"]))
+            self.lb_epp.setText(str(int(st["epp"])))
+        else:
+            self.lb_epp.setText("不支持")
+
+    def apply_states(self):
+        mn, mx = self.spin_min.value(), self.spin_max.value()
+        guid = self.plan_combo.currentData()
+        if mn > mx:
+            return warn(self, "最小状态不能大于最大状态。")
+        Tasks.run(self,
+                  lambda: (S.cpu_set_state("min", mn, guid), S.cpu_set_state("max", mx, guid)),
+                  lambda r: info(self, "已写入该计划。")
+                  if all(x.get("ok") for x in r) else
+                  warn(self, "应用失败：%s" % "; ".join(x.get("err", "") for x in r if not x.get("ok"))),
+                  on_fail=lambda m: warn(self, "失败：" + m))
+
+    def apply_epp(self):
+        v = self.slider_epp.value()
+        guid = self.plan_combo.currentData()
+        Tasks.run(self, lambda: S.cpu_set_state("epp", v, guid),
+                  lambda r: info(self, "EPP=%d 已写入该计划。" % v)
+                  if r.get("ok") else warn(self, "应用失败：%s" % r.get("err")),
+                  on_fail=lambda m: warn(self, "失败：" + m))
+
+    # ---------- 大小核 ----------
+    def load_procs(self):
+        Tasks.run(self, lambda: S.list_processes(120), self._got_procs,
+                  on_fail=lambda *_: None)
+
+    def _got_procs(self, procs):
+        cur = self.proc_combo.currentData()
+        self.proc_combo.blockSignals(True)
+        self.proc_combo.clear()
+        self.proc_combo.addItem("（选择进程）", None)
+        for p in procs or []:
+            self.proc_combo.addItem("%s (%d)" % (p["name"], p["pid"]), p["pid"])
+        if cur:
+            ix = self.proc_combo.findData(cur)
+            if ix >= 0:
+                self.proc_combo.setCurrentIndex(ix)
+        self.proc_combo.blockSignals(False)
+
+    def set_affinity(self, target):
+        if not self.win.admin_mode:
+            return self.win._warn_readonly()
+        pid = self.proc_combo.currentData()
+        if not pid:
+            return info(self, "请先选择一个进程。")
+        r = S.set_process_affinity(pid, target)
+        name = self.proc_combo.currentText()
+        if r.get("ok"):
+            self.lb_aff.setText("已把 %s 绑定到 %s 核（掩码 0x%X）"
+                                % (name, "P" if target == "P" else
+                                   ("E" if target == "E" else "全部"), r.get("mask", 0)))
+        else:
+            self.lb_aff.setText("失败：%s" % r.get("err"))
+
+    # ---------- E-core 全局 ----------
+    def _got_ecore(self, st):
+        if not st:
+            self.lb_ecore.setText("当前：读取失败")
+            return
+        if st.get("set"):
+            self.lb_ecore.setText("当前：numproc=%d（已限制核心数，重启后生效中）" % st["numproc"])
+        else:
+            self.lb_ecore.setText("当前：未限制（全部核心启用）")
+
+    def ecore_off(self):
+        if not self.win.admin_mode:
+            return self.win._warn_readonly()
+        if not confirm(self, "禁用 E-core",
+                       "将执行 bcdedit 设置 numproc 只保留 P 核，重启电脑后生效。\n\n"
+                       "副作用：多线程性能下降；个别软件授权校验可能异常。\n"
+                       "随时可在本页点“恢复全部核心”撤销。继续？", danger=True):
+            return
+        Tasks.run(self, S.ecore_disable,
+                  lambda r: (self.refresh(),
+                             info(self, "已设置 numproc=%d，重启后生效。" % r["numproc"])
+                             if r.get("ok") else
+                             warn(self, "失败：%s" % r.get("err")))[1],
+                  on_fail=lambda m: warn(self, "失败：" + m))
+
+    def ecore_on(self):
+        if not self.win.admin_mode:
+            return self.win._warn_readonly()
+        Tasks.run(self, S.ecore_restore,
+                  lambda r: (self.refresh(),
+                             info(self, "已恢复全部核心，重启后生效。") if r.get("ok")
+                             else warn(self, "失败：%s（可能本来就没限制）" % r.get("err")))[1],
+                  on_fail=lambda m: warn(self, "失败：" + m))
 
 
 # ==========================================================================
@@ -2074,7 +2735,7 @@ class StartupPage(Page):
         self.s_n = pill("0 项", "")
         b1.addWidget(self.s_n)
         l1.addLayout(b1)
-        self.t1 = make_table(["名称", "位置", "命令"])
+        self.t1 = make_table(["名称", "位置", "命令"], sortable=True)
         l1.addWidget(self.t1, 1)
         self.tabs.addTab(w1, "开机启动项")
 
@@ -2094,7 +2755,7 @@ class StartupPage(Page):
             self.svc_btns.append(b)
             b2.addWidget(b)
         l2.addLayout(b2)
-        self.t2 = make_table(["服务名", "显示名", "状态", "启动类型"])
+        self.t2 = make_table(["服务名", "显示名", "状态", "启动类型"], sortable=True)
         l2.addWidget(self.t2, 1)
         self.tabs.addTab(w2, "系统服务")
 
@@ -2199,7 +2860,7 @@ class PerfPage(Page):
         b.addWidget(btn("整理所选进程", on_click=self.trim_one))
         b.addWidget(btn("刷新进程列表", on_click=self.load_procs))
         v4.addLayout(b)
-        self.table = make_table(["进程", "PID", "内存占用"])
+        self.table = make_table(["进程", "PID", "内存占用"], sortable=True)
         v4.addWidget(self.table, 1)
         root.addWidget(f4, 1)
 
@@ -2613,7 +3274,8 @@ class SpeedTestPage(Page):
 class DNSPage(Page):
     title = "DNS 检测"
 
-    MODES = [("国内", "domestic"), ("国外", "foreign"), ("混合", "mixed")]
+    MODES = [("国内", "domestic"), ("国外", "foreign"), ("混合", "mixed"),
+             ("IPv6", "ipv6")]
 
     def __init__(self, win):
         super().__init__(win)
@@ -2647,6 +3309,14 @@ class DNSPage(Page):
         vp.addWidget(self.ping_status)
         self.ping_table = make_table(["目标", "IP 地址", "发送/接收", "丢失率", "最短 / 最长 / 平均", "状态"])
         vp.addWidget(self.ping_table)
+        # 持续 Ping 延迟明细：每次结果一行，新的在最上，向下依次是历史
+        vd_hint = QLabel("延迟明细（新结果在上，向下为历史）：")
+        vd_hint.setObjectName("Muted3")
+        vp.addWidget(vd_hint)
+        self.ping_detail = make_table(["序号", "时间", "延迟", "状态"])
+        self.ping_detail.setMinimumHeight(140)
+        self.ping_detail.setMaximumHeight(240)
+        vp.addWidget(self.ping_detail)
         root.addWidget(f_ping)
 
         # ---------- 2. DNS 测试（解析速度） ----------
@@ -2669,7 +3339,7 @@ class DNSPage(Page):
         bar.addWidget(btn("开始测试", "Primary", on_click=self.test))
         vd.addLayout(bar)
         vd.addWidget(self.status)
-        self.table = make_table(["DNS 服务器", "解析结果", "延迟", "状态"])
+        self.table = make_table(["DNS 服务器", "分类", "解析结果", "延迟", "状态"], sortable=True)
         vd.addWidget(self.table)
         root.addWidget(f_dns)
         root.addStretch(0)
@@ -2694,6 +3364,7 @@ class DNSPage(Page):
         self._ping_stats = {"sent": 0, "recv": 0, "min": None, "max": None,
                             "sum": 0, "ip": None, "ok_once": False}
         self.ping_table.setRowCount(0)
+        self.ping_detail.setRowCount(0)
         self.ping_btn.setText("停止")
         self.ping_btn.setObjectName("Danger")
         self.ping_btn.style().unpolish(self.ping_btn); self.ping_btn.style().polish(self.ping_btn)
@@ -2715,6 +3386,17 @@ class DNSPage(Page):
                 s["sum"] += r["ms"]
                 s["min"] = r["ms"] if s["min"] is None else min(s["min"], r["ms"])
                 s["max"] = r["ms"] if s["max"] is None else max(s["max"], r["ms"])
+        # 延迟明细：新结果插到第 0 行（最上面），向下依次是历史；最多留 200 条
+        self.ping_detail.insertRow(0)
+        row = [str(s["sent"]), time.strftime("%H:%M:%S"),
+               ("%d ms" % r["ms"]) if (r.get("ok") and r.get("ms") is not None) else "—",
+               "成功" if r.get("ok") else "超时"]
+        for c, v in enumerate(row):
+            it = QTableWidgetItem(v)
+            it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+            self.ping_detail.setItem(0, c, it)
+        if self.ping_detail.rowCount() > 200:
+            self.ping_detail.removeRow(self.ping_detail.rowCount() - 1)
         self._repaint_ping()
 
     def _repaint_ping(self):
@@ -2766,14 +3448,16 @@ class DNSPage(Page):
         for x in r:
             rows.append([
                 "%s (%s)" % (x["name"], x["ip"]),
+                x.get("cat") or "—",
                 x.get("answer") or "—",
                 ("%d ms" % x["ms"]) if x["ok"] and x["ms"] is not None else "—",
                 "可用" if x["ok"] else "不可用"
             ])
         fill_table(self.table, rows)
-        self.table.setColumnWidth(0, 180)
-        self.table.setColumnWidth(1, 130)
-        self.table.setColumnWidth(2, 90)
+        self.table.setColumnWidth(0, 200)
+        self.table.setColumnWidth(1, 56)
+        self.table.setColumnWidth(2, 120)
+        self.table.setColumnWidth(3, 80)
         ok = [x for x in r if x["ok"]]
         if ok and ok[0].get("ms") is not None:
             self.status.setText("最快：%s（%d ms），共 %d / %d 个可用，解析到 %s" %
@@ -2805,67 +3489,175 @@ class CleanupPage(Page):
         self.sum = pill("—", "")
         bar.addWidget(self.sum)
         root.addLayout(bar)
-        root.addWidget(notice("扫描只统计体积，不会删除东西。清理时正在被占用的文件会自动跳过。",
-                              "info"))
+        root.addWidget(notice(
+            "扫描只统计体积，不会删除东西。清理时正在被占用的文件会自动跳过。<br>"
+            "<b>建议清理</b>（绿色）＝删了没有任何影响；<b>可以清理</b>（蓝色）＝删了会重新生成，"
+            "首次打开可能稍慢；<b>谨慎清理</b>（橙色）＝涉及回收站或系统缓存，默认不勾选，"
+            "请确认后再勾。每项的「说明」列写明了这些文件是什么。", "info"))
+
+        # 扫描进度（带百分比）：扫描期间不列数据，扫完一次性列出
+        self.prog_row = QWidget()
+        pr = QHBoxLayout(self.prog_row)
+        pr.setContentsMargins(0, 0, 0, 0)
+        pr.setSpacing(10)
+        self.prog_lb = QLabel(""); self.prog_lb.setObjectName("Muted")
+        self.prog = QProgressBar()
+        self.prog.setRange(0, 100)
+        self.prog.setValue(0)
+        self.prog.setTextVisible(True)
+        self.prog.setFormat("%p%")
+        self.prog.setMinimumWidth(240)
+        pr.addWidget(self.prog_lb, 0)
+        pr.addWidget(self.prog, 1)
+        self.prog_row.setVisible(False)
+        root.addWidget(self.prog_row)
 
         f, v = card("可清理项目")
-        self.table = make_table(["", "项目", "路径", "体积", "文件数"])
+        self.table = make_table(["", "项目", "建议", "路径", "体积", "文件数", "说明"],
+                                sortable=True)
         self.table.setColumnWidth(0, 34)
+        self.table.itemChanged.connect(lambda *_: self.update_sum())
         v.addWidget(self.table, 1)
         root.addWidget(f, 1)
 
     def refresh(self):
-        self.scan()
+        """不再自动扫描：进入页面只重置为待扫描状态，由用户点「开始扫描」触发。"""
+        self._scan_token = getattr(self, "_scan_token", 0) + 1   # 作废进行中的扫描
+        self.items = []
+        self.table.setRowCount(0)
+        self.prog_row.setVisible(False)
+        self.sum.setText("未扫描")
+        self.sum.setObjectName("Pill")
+        self.sum.style().unpolish(self.sum)
+        self.sum.style().polish(self.sum)
 
     def scan(self):
-        self.win.busy("正在统计…")
-        Tasks.run(self, S.scan_junk, lambda r: (self.win.idle(), self._got(r))[1],
-                  on_fail=lambda m: (self.win.idle(), warn(self, m))[1])
+        """并行扫描所有垃圾目录：期间显示进度条与百分比，扫完一次性列出结果。"""
+        self._scan_token = getattr(self, "_scan_token", 0) + 1
+        token = self._scan_token
+        self.table.setRowCount(0)
+        self.items = []
+        targets = [t["id"] for t in S.junk_targets()] + ["recyclebin"]
+        total = len(targets)
+        self.prog_row.setVisible(True)
+        self.prog.setRange(0, total)
+        self.prog.setValue(0)
+        self.prog_lb.setText("正在扫描 0/%d…" % total)
+        self.sum.setText("扫描中…")
+        self.win.busy("正在扫描垃圾文件…")
+        self._res = {}
+        self._done_n = 0
 
-    def _got(self, items):
+        for tid in targets:
+            Tasks.run(self, lambda t=tid: S.junk_item_size(t),
+                      lambda r, tk=token: self._one_done(tk, r, total),
+                      on_fail=lambda _m, tk=token: self._one_step(tk, total))
+
+    def _one_done(self, token, r, total):
+        if token != getattr(self, "_scan_token", 0):
+            return
+        if r:
+            self._res[r["id"]] = r
+        self._one_step(token, total)
+
+    def _one_step(self, token, total):
+        if token != getattr(self, "_scan_token", 0):
+            return
+        self._done_n += 1
+        self.prog.setValue(self._done_n)
+        self.prog_lb.setText("正在扫描 %d/%d…" % (self._done_n, total))
+        if self._done_n >= total:
+            self._finish(token)
+
+    def _finish(self, token):
+        if token != getattr(self, "_scan_token", 0):
+            return
+        order = [t["id"] for t in S.junk_targets()] + ["recyclebin"]
+        items = [self._res[i] for i in order if i in self._res]
         self.items = items
+        # 扫完一次性填表（填表期间关排序，避免行错位）
+        self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
         for x in items:
             i = self.table.rowCount()
             self.table.insertRow(i)
+            lv = x.get("level") or "ok"
             cb = QTableWidgetItem()
             cb.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
-            cb.setCheckState(Qt.Checked if x["size"] > 0 else Qt.Unchecked)
+            # 默认只勾「建议清理 / 可以清理」，谨慎项留空由用户自己决定
+            cb.setCheckState(Qt.Unchecked if lv == "caution" else Qt.Checked)
+            cb.setData(Qt.UserRole, x["id"])     # 排序后仍能对上数据
             self.table.setItem(i, 0, cb)
-            for c, val in enumerate([x["name"], x["path"], fmt_bytes(x["size"]), x["files"]],
-                                    start=1):
-                it = QTableWidgetItem(str(val))
+
+            lv_txt, lv_color = {
+                "recommend": ("建议清理", T.get_color("OK", self.win.dark)),
+                "ok": ("可以清理", T.get_color("BLUE", self.win.dark)),
+                "caution": ("谨慎清理", T.get_color("WARN", self.win.dark)),
+            }.get(lv, ("可以清理", T.get_color("BLUE", self.win.dark)))
+            it_lv = SortItem(lv_txt)
+            it_lv.setFlags(it_lv.flags() & ~Qt.ItemIsEditable)
+            it_lv.setForeground(QBrush(QColor(lv_color)))
+            it_lv.setData(Qt.UserRole + 1, {"recommend": 0, "ok": 1, "caution": 2}[lv])
+            it_lv.setToolTip(x.get("what") or "")
+            self.table.setItem(i, 2, it_lv)
+
+            what = x.get("what") or ""
+            for col, val in ((1, x["name"]), (3, x["path"]), (4, fmt_bytes(x["size"])),
+                             (5, x["files"]), (6, what)):
+                it = SortItem(str(val))
                 it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+                num = _sort_num(val)
+                if num is not None:
+                    it.setData(Qt.UserRole + 1, num)
                 it.setToolTip(str(val))
-                self.table.setItem(i, c, it)
-            self.table.setRowHeight(i, 34)
-        self.table.setColumnWidth(1, 230)
-        self.table.setColumnWidth(2, 330)
-        self.table.setColumnWidth(3, 100)
+                self.table.setItem(i, col, it)
+            self.table.setRowHeight(i, 40)
+        self.table.setSortingEnabled(True)
+        self.table.setColumnWidth(1, 200)
+        self.table.setColumnWidth(2, 82)
+        self.table.setColumnWidth(3, 280)
+        self.table.setColumnWidth(4, 90)
+        self.table.setColumnWidth(5, 70)
+        self.table.setColumnWidth(6, 330)
+        self.prog_lb.setText("扫描完成（%d 项）" % len(items))
+        self.prog.setValue(self.prog.maximum())
+        self.prog_row.setVisible(False)
+        self.win.idle()
         self.update_sum()
 
     def update_sum(self):
         total = 0
-        for i, x in enumerate(self.items):
-            it = self.table.item(i, 0)
-            if it and it.checkState() == Qt.Checked:
-                total += x["size"]
+        for x in self.items:
+            for r in range(self.table.rowCount()):
+                it = self.table.item(r, 0)
+                if it and it.data(Qt.UserRole) == x["id"] and it.checkState() == Qt.Checked:
+                    total += x["size"]
+                    break
         self.sum.setText("可清理 " + fmt_bytes(total))
 
     def clean(self):
         if not self.win.admin_mode:
             return self.win._warn_readonly()
-        ids = []
-        for i, x in enumerate(self.items):
-            it = self.table.item(i, 0)
+        ids, total = [], 0
+        by_id = {x["id"]: x for x in self.items}
+        for r in range(self.table.rowCount()):
+            it = self.table.item(r, 0)
             if it and it.checkState() == Qt.Checked:
-                ids.append(x["id"])
+                tid = it.data(Qt.UserRole)
+                if tid and by_id.get(tid, {}).get("size", 0) > 0:
+                    ids.append(tid)
+                    total += by_id[tid]["size"]
         if not ids:
             return info(self, "没有选择任何项。")
-        total = sum(x["size"] for x in self.items if x["id"] in ids)
+        caution = [by_id[i]["name"] for i in ids
+                   if (by_id[i].get("level") == "caution")]
+        tip = ""
+        if caution:
+            tip = ("\n\n⚠️ 其中包含谨慎项：\n  · " + "\n  · ".join(caution) +
+                   "\n（回收站清空后不可恢复；Prefetch 删除后短期内程序启动会变慢）")
         if not confirm(self, "确认清理",
-                       "将删除约 %s 的临时/缓存文件。\n\n⚠️ 删除后无法恢复，回收站也会被清空。"
-                       % fmt_bytes(total), danger=True):
+                       "将删除约 %s 的临时/缓存文件。\n\n⚠️ 删除后无法恢复。%s"
+                       % (fmt_bytes(total), tip), danger=True):
             return
         self.win.busy("正在清理…")
         Tasks.run(self, lambda: S.clean_junk(ids),
@@ -2905,20 +3697,48 @@ class PoliciesPage(Page):
         bar.addWidget(self.sum)
         root.addLayout(bar)
 
+        self.prog_row = QWidget()
+        pr = QHBoxLayout(self.prog_row)
+        pr.setContentsMargins(0, 0, 0, 0)
+        pr.setSpacing(10)
+        self.prog_lb = QLabel("正在扫描注册表策略项…")
+        self.prog_lb.setObjectName("Muted")
+        self.prog = QProgressBar()
+        self.prog.setRange(0, 0)          # 不确定进度：策略项很少，扫描通常 <1s
+        self.prog.setTextVisible(False)
+        self.prog.setMinimumWidth(240)
+        pr.addWidget(self.prog_lb, 0)
+        pr.addWidget(self.prog, 1)
+        self.prog_row.setVisible(False)
+        root.addWidget(self.prog_row)
+
         f, v = card("检测结果")
-        self.table = make_table(["", "注册表路径", "影响", "值数量"])
+        self.table = make_table(["", "注册表路径", "影响", "值数量"], sortable=True)
         self.table.setColumnWidth(0, 34)
         v.addWidget(self.table, 1)
         root.addWidget(f, 1)
 
     def refresh(self):
-        self.scan()
+        """不再自动扫描：进入页面只重置为待扫描状态，由用户点按钮触发。"""
+        self.found = []
+        self.table.setRowCount(0)
+        self.sum.setText("未扫描")
+        self.sum.setObjectName("Pill")
+        self.sum.style().unpolish(self.sum); self.sum.style().polish(self.sum)
 
     def scan(self):
-        Tasks.run(self, S.policies_scan, self._got)
+        self.win.busy("正在扫描策略残留…")
+        self.prog_row.setVisible(True)
+        Tasks.run(self, S.policies_scan,
+                  lambda r: (self.win.idle(), self.prog_row.setVisible(False),
+                             self._got(r))[-1],
+                  on_fail=lambda m: (self.win.idle(), self.prog_row.setVisible(False),
+                                     warn(self, m))[-1])
 
     def _got(self, found):
         self.found = found
+        # 填表期间必须关排序，否则行会错位/留空行
+        self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
         for x in found:
             i = self.table.rowCount()
@@ -2926,6 +3746,7 @@ class PoliciesPage(Page):
             cb = QTableWidgetItem()
             cb.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
             cb.setCheckState(Qt.Checked)
+            cb.setData(Qt.UserRole, x["path"])   # 排序后仍能对上路径
             self.table.setItem(i, 0, cb)
             for c, val in enumerate([x["path"], x["why"], x["count"]], start=1):
                 it = QTableWidgetItem(str(val))
@@ -2933,6 +3754,7 @@ class PoliciesPage(Page):
                 it.setToolTip(str(val))
                 self.table.setItem(i, c, it)
             self.table.setRowHeight(i, 34)
+        self.table.setSortingEnabled(True)
         self.table.setColumnWidth(1, 420)
         self.table.setColumnWidth(2, 300)
         if not found:
@@ -2946,26 +3768,40 @@ class PoliciesPage(Page):
     def fix(self):
         if not self.win.admin_mode:
             return self.win._warn_readonly()
+        if not self.found:
+            return info(self, "请先点“扫描策略残留”。")
         paths = []
-        for i, x in enumerate(self.found):
-            it = self.table.item(i, 0)
+        for r in range(self.table.rowCount()):
+            it = self.table.item(r, 0)
             if it and it.checkState() == Qt.Checked:
-                paths.append(x["path"])
+                p = it.data(Qt.UserRole)
+                if p:
+                    paths.append(p)
         if not paths:
             return info(self, "没有选择任何项。")
         if not confirm(self, "清除策略残留",
                        "将删除 %d 处组策略分支，并解除更新暂停。\n\n"
-                       "会把每一项先导出成 .reg 备份（存放在程序目录的 backup\\ 下），"
-                       "出问题双击备份即可还原。\n\n清除后需要重启，“由你的组织管理”才会消失。"
-                       % len(paths), danger=True):
+                       "清理前会先把每一项导出成 .reg 备份，存放在：\n%s\n"
+                       "出问题双击对应备份即可还原。\n\n"
+                       "清除后需要重启，“由你的组织管理”才会消失。"
+                       % (len(paths), S.BACKUP), danger=True):
             return
         self.win.busy("正在清除…")
         Tasks.run(self, lambda: S.policies_fix(paths),
-                  lambda r: (self.win.idle(),
-                             info(self, "已清除 %d / %d 处。备份在程序目录 backup\\ 下。\n\n"
-                                        "请重启电脑。" % (len([x for x in r if x["ok"]]), len(r))),
-                             self.scan())[-1],
+                  lambda r: (self.win.idle(), self._fixed(r))[1],
                   on_fail=lambda m: (self.win.idle(), warn(self, m))[1])
+
+    def _fixed(self, r):
+        r = r or {}
+        results = r.get("results") or []
+        backups = r.get("backups") or []
+        ok = len([x for x in results if x.get("ok")])
+        self.scan()
+        if backups:
+            info(self, "已清除 %d / %d 处。\n\n已备份 %d 个 .reg 文件到：\n%s\n\n请重启电脑。"
+                 % (ok, len(results), len(backups), r.get("backup_dir") or S.BACKUP))
+        else:
+            info(self, "已清除 %d / %d 处（未生成备份文件）。\n\n请重启电脑。" % (ok, len(results)))
 
 
 # ==========================================================================
@@ -3038,7 +3874,8 @@ class SettingsPage(Page):
         root.addWidget(f_pref)
 
         f3, v3 = card("关于")
-        rows = [("软件名称", APP_NAME), ("版本", APP_VER),
+        rows = [("软件名称", APP_NAME), ("版本", "v%s" % APP_VER),
+                ("作者", "by：%s" % AUTHOR),
                 ("权限", "管理员 ✓" if IS_ADMIN else "普通（功能受限）"),
                 ("数据目录", S.APP_DIR)]
         g = QGridLayout(); g.setSpacing(8)
@@ -3046,9 +3883,29 @@ class SettingsPage(Page):
             a = QLabel(k); a.setObjectName("Muted")
             b = QLabel(str(val)); b.setWordWrap(True)
             g.addWidget(a, i, 0); g.addWidget(b, i, 1)
+        # GitHub：文本链接 + 一键按钮
+        a = QLabel("GitHub"); a.setObjectName("Muted")
+        link = QLabel('<a href="%s" style="color:%s; text-decoration:none;">%s</a>'
+                      % (GITHUB_URL, T.get_color("BLUE", self.win.dark), GITHUB_URL))
+        link.setOpenExternalLinks(True)
+        link.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        link.setCursor(Qt.PointingHandCursor)
+        link.setWordWrap(True)
+        link.setToolTip("点击在浏览器中打开项目主页")
+        g.addWidget(a, len(rows), 0); g.addWidget(link, len(rows), 1)
+        hb = QHBoxLayout()
+        hb.addWidget(btn("打开 GitHub 项目主页", "Primary",
+                         on_click=lambda: self.open_github()))
+        hb.addStretch(1)
         v3.addLayout(g)
+        v3.addLayout(hb)
         root.addWidget(f3)
         root.addStretch(1)
+
+    def open_github(self):
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+        QDesktopServices.openUrl(QUrl(GITHUB_URL))
 
     def refresh(self):
         self.lb_path.setText("配置文件：%s" % SETTINGS_FILE)
@@ -3131,6 +3988,7 @@ class SettingsPage(Page):
 class MainWindow(FramelessWindow):
     NAV = [("overview", "概览", OverviewPage),
            ("optimize", "系统优化", OptimizePage),
+           ("cputune", "CPU 调试", CpuTunePage),
            ("security", "安全检测", SecurityPage),
            ("software", "软件管理", SoftwarePage),
            ("startup", "启动与服务", StartupPage),
@@ -3288,10 +4146,7 @@ class MainWindow(FramelessWindow):
 
         self._admin_label()
         self._apply_qss()
-        self.goto("overview")
-        lp = self.settings.get("last_page")
-        if lp:
-            QTimer.singleShot(0, lambda: self.goto(lp))
+        self.goto("overview")   # 每次打开都从概览页开始，不再恢复上次的页面
 
     def showEvent(self, e):
         super().showEvent(e)
@@ -3492,7 +4347,7 @@ class MainWindow(FramelessWindow):
                 for page in self.pages.values():
                     if hasattr(page, "on_exit"):
                         page.on_exit()
-                self.settings["last_page"] = self.NAV[self.stack.currentIndex()][0]
+                self.settings.pop("last_page", None)   # 打开固定显示概览页
                 self.settings["window"] = {"w": self.width(), "h": self.height()}
                 settings_save(self.settings)
                 if getattr(self, "tray", None):

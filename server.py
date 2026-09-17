@@ -484,6 +484,7 @@ def list_software():
                                 "uninstall": q("UninstallString"),
                                 "quiet": q("QuietUninstallString"),
                                 "location": q("InstallLocation"),
+                                "icon": q("DisplayIcon"),
                             })
                     except OSError:
                         continue
@@ -508,6 +509,131 @@ STARTUP_LOCATIONS = [
     ("HKLM", r"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"),
     ("HKCU", r"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"),
 ]
+
+
+def residual_scan(name, publisher="", location="", cap=40):
+    """卸载后的残留扫描：只定位、不删除。返回 {"files": [...], "reg": [...]}。
+
+    files: 在常见安装/数据目录里找名称相关的目录与文件（含大小）；
+    reg:   HKLM/HKCU 的 SOFTWARE（含 WOW6432Node）第一层子键中名称相关的项。
+    """
+    tokens = set()
+    for src in (name or "", publisher or ""):
+        s = re.sub(r"[^\w\u4e00-\u9fff]+", " ", src or "").strip().lower()
+        if s:
+            tokens.add(s)
+            for w in s.split():
+                if len(w) >= 3 and w not in ("inc", "ltd", "llc", "software", "the"):
+                    tokens.add(w)
+    loc = (location or "").strip()
+    if loc and os.path.isdir(loc):
+        tokens.add(os.path.basename(loc.rstrip("\\/")).lower())
+
+    files, seen = [], set()
+    roots = [os.environ.get(k, "") for k in
+             ("ProgramFiles", "ProgramFiles(x86)", "ProgramData",
+              "LOCALAPPDATA", "APPDATA")]
+    for base in roots:
+        if not base or not os.path.isdir(base):
+            continue
+        try:
+            entries = os.listdir(base)
+        except OSError:
+            continue
+        for entry in entries:
+            el = entry.lower()
+            if not any(t == el or t in el for t in tokens):
+                continue
+            full = os.path.join(base, entry)
+            if full.lower() in seen:
+                continue
+            seen.add(full.lower())
+            try:
+                sz = dir_size(full, cap=5000)[0] if os.path.isdir(full) \
+                    else os.path.getsize(full)
+            except OSError:
+                sz = 0
+            files.append({"path": full, "kind": "dir" if os.path.isdir(full) else "file",
+                          "bytes": sz})
+            if len(files) >= cap:
+                break
+        if len(files) >= cap:
+            break
+
+    regs = []
+    if winreg is not None and tokens:
+        targets = [(winreg.HKEY_LOCAL_MACHINE, "HKLM", r"SOFTWARE"),
+                   (winreg.HKEY_LOCAL_MACHINE, "HKLM", r"SOFTWARE\WOW6432Node"),
+                   (winreg.HKEY_CURRENT_USER, "HKCU", r"SOFTWARE")]
+        for root, hive, sub in targets:
+            try:
+                k = winreg.OpenKey(root, sub, 0, winreg.KEY_READ)
+            except OSError:
+                continue
+            try:
+                n = winreg.QueryInfoKey(k)[0]
+                for i in range(n):
+                    try:
+                        sk_name = winreg.EnumKey(k, i)
+                    except OSError:
+                        continue
+                    skl = sk_name.lower()
+                    if not any(t == skl or t in skl for t in tokens):
+                        continue
+                    regs.append({"hive": hive, "path": sub + "\\" + sk_name})
+                    if len(regs) >= cap:
+                        break
+            finally:
+                winreg.CloseKey(k)
+            if len(regs) >= cap:
+                break
+    return {"files": files, "reg": regs, "tokens": sorted(tokens)}
+
+
+def residual_clean(files, regs):
+    """删除所选残留。文件直接删除（仅限白名单根目录下），注册表整键递归删除。
+
+    返回 {"ok": bool, "msg": [...]}，逐条报告失败原因。
+    """
+    msgs = []
+    ok = True
+    allowed_roots = [os.path.abspath(os.environ.get(k, "")).lower() for k in
+                     ("ProgramFiles", "ProgramFiles(x86)", "ProgramData",
+                      "LOCALAPPDATA", "APPDATA")]
+    allowed_roots = [r for r in allowed_roots if r]
+    for it in files or []:
+        p = (it.get("path") or "").strip()
+        pl = os.path.abspath(p).lower()
+        if not any(pl.startswith(r + os.sep) for r in allowed_roots):
+            msgs.append("拒绝（不在允许的目录内）：%s" % p)
+            ok = False
+            continue
+        try:
+            if os.path.isdir(p):
+                shutil.rmtree(p)
+            else:
+                os.remove(p)
+            msgs.append("已删除：%s" % p)
+        except Exception as e:
+            ok = False
+            msgs.append("失败：%s（%s）" % (p, str(e)[:80]))
+    for it in regs or []:
+        hive = it.get("hive")
+        path = (it.get("path") or "").strip()
+        # 安全闸：只允许删 SOFTWARE 与 SOFTWARE\WOW6432Node 的第一层子键
+        if hive not in ("HKLM", "HKCU") or \
+                not re.match(r"^SOFTWARE(\\WOW6432Node)?\\[^\\]+$", path, re.I):
+            msgs.append("拒绝（超出安全范围）：%s\\%s" % (hive, path))
+            ok = False
+            continue
+        root = winreg.HKEY_LOCAL_MACHINE if hive == "HKLM" else winreg.HKEY_CURRENT_USER
+        try:
+            _delete_tree(root, path)
+            msgs.append("已删除注册表：HK%s\\%s" % ("LM" if hive == "HKLM" else "CU", path))
+        except Exception as e:
+            ok = False
+            msgs.append("失败：%s\\%s（%s）" % (hive, path, str(e)[:80]))
+    return {"ok": ok, "msg": msgs}
 
 
 def list_startup():
@@ -770,30 +896,165 @@ def net_repair(keys):
 import random
 
 DNS_SERVERS = {
+    # 数据源：用户提供的 DnsList.json（DnsTools），已按运营商/厂商分类
     "domestic": [
-        {"name": "阿里 DNS", "ip": "223.5.5.5"},
-        {"name": "阿里 DNS 2", "ip": "223.6.6.6"},
-        {"name": "腾讯 DNS", "ip": "119.29.29.29"},
-        {"name": "DNSPod", "ip": "182.254.116.116"},
         {"name": "114 DNS", "ip": "114.114.114.114"},
-        {"name": "百度 DNS", "ip": "180.76.76.76"},
+        {"name": "114 DNS", "ip": "114.114.115.115"},
+        {"name": "阿里 AliDNS", "ip": "223.5.5.5"},
+        {"name": "阿里 AliDNS", "ip": "223.6.6.6"},
+        {"name": "百度 BaiduDNS", "ip": "180.76.76.76"},
+        {"name": "DNSPod DNS+", "ip": "119.29.29.29"},
+        {"name": "DNSPod DNS+", "ip": "182.254.116.116"},
+        {"name": "CNNIC SDNS", "ip": "1.2.4.8"},
+        {"name": "CNNIC SDNS", "ip": "210.2.4.8"},
+        {"name": "oneDNS", "ip": "117.50.11.11"},
+        {"name": "oneDNS", "ip": "117.50.22.22"},
+        {"name": "DNS派 电信/移动/铁通", "ip": "101.226.4.6"},
+        {"name": "DNS派 电信/移动/铁通", "ip": "218.30.118.6"},
+        {"name": "DNS派 联通", "ip": "123.125.81.6"},
+        {"name": "DNS派 联通", "ip": "140.207.198.6"},
+        {"name": "安徽电信 DNS", "ip": "61.132.163.68"},
+        {"name": "安徽电信 DNS", "ip": "202.102.213.68"},
+        {"name": "北京电信 DNS", "ip": "219.141.136.10"},
+        {"name": "北京电信 DNS", "ip": "219.141.140.10"},
+        {"name": "重庆电信 DNS", "ip": "61.128.192.68"},
+        {"name": "重庆电信 DNS", "ip": "61.128.128.68"},
+        {"name": "福建电信 DNS", "ip": "218.85.152.99"},
+        {"name": "福建电信 DNS", "ip": "218.85.157.99"},
+        {"name": "甘肃电信 DNS", "ip": "202.100.64.68"},
+        {"name": "甘肃电信 DNS", "ip": "61.178.0.93"},
+        {"name": "广东电信 DNS", "ip": "202.96.128.86"},
+        {"name": "广东电信 DNS", "ip": "202.96.128.166"},
+        {"name": "广东电信 DNS", "ip": "202.96.134.33"},
+        {"name": "广东电信 DNS", "ip": "202.96.128.68"},
+        {"name": "广西电信 DNS", "ip": "202.103.225.68"},
+        {"name": "广西电信 DNS", "ip": "202.103.224.68"},
+        {"name": "贵州电信 DNS", "ip": "202.98.192.67"},
+        {"name": "贵州电信 DNS", "ip": "202.98.198.167"},
+        {"name": "河南电信 DNS", "ip": "222.88.88.88"},
+        {"name": "河南电信 DNS", "ip": "222.85.85.85"},
+        {"name": "黑龙江电信 DNS", "ip": "219.147.198.230"},
+        {"name": "黑龙江电信 DNS", "ip": "219.147.198.242"},
+        {"name": "湖北电信 DNS", "ip": "202.103.24.68"},
+        {"name": "湖北电信 DNS", "ip": "202.103.0.68"},
+        {"name": "湖南电信 DNS", "ip": "222.246.129.80"},
+        {"name": "湖南电信 DNS", "ip": "59.51.78.211"},
+        {"name": "江苏电信 DNS", "ip": "218.2.2.2"},
+        {"name": "江苏电信 DNS", "ip": "218.4.4.4"},
+        {"name": "江苏电信 DNS", "ip": "61.147.37.1"},
+        {"name": "江苏电信 DNS", "ip": "218.2.135.1"},
+        {"name": "江西电信 DNS", "ip": "202.101.224.69"},
+        {"name": "江西电信 DNS", "ip": "202.101.226.68"},
+        {"name": "内蒙古电信 DNS", "ip": "219.148.162.31"},
+        {"name": "内蒙古电信 DNS", "ip": "222.74.39.50"},
+        {"name": "山东电信 DNS", "ip": "219.146.1.66"},
+        {"name": "山东电信 DNS", "ip": "219.147.1.66"},
+        {"name": "陕西电信 DNS", "ip": "218.30.19.40"},
+        {"name": "陕西电信 DNS", "ip": "61.134.1.4"},
+        {"name": "上海电信 DNS", "ip": "202.96.209.133"},
+        {"name": "上海电信 DNS", "ip": "116.228.111.118"},
+        {"name": "上海电信 DNS", "ip": "202.96.209.5"},
+        {"name": "上海电信 DNS", "ip": "108.168.255.118"},
+        {"name": "四川电信 DNS", "ip": "61.139.2.69"},
+        {"name": "四川电信 DNS", "ip": "218.6.200.139"},
+        {"name": "天津电信 DNS", "ip": "219.150.32.132"},
+        {"name": "天津电信 DNS", "ip": "219.146.0.132"},
+        {"name": "云南电信 DNS", "ip": "222.172.200.68"},
+        {"name": "云南电信 DNS", "ip": "61.166.150.123"},
+        {"name": "浙江电信 DNS", "ip": "202.101.172.35"},
+        {"name": "浙江电信 DNS", "ip": "61.153.177.196"},
+        {"name": "浙江电信 DNS", "ip": "61.153.81.75"},
+        {"name": "浙江电信 DNS", "ip": "60.191.244.5"},
+        {"name": "北京联通 DNS", "ip": "123.123.123.123"},
+        {"name": "北京联通 DNS", "ip": "123.123.123.124"},
+        {"name": "北京联通 DNS", "ip": "202.106.0.20"},
+        {"name": "北京联通 DNS", "ip": "202.106.195.68"},
+        {"name": "重庆联通 DNS", "ip": "221.5.203.98"},
+        {"name": "重庆联通 DNS", "ip": "221.7.92.98"},
+        {"name": "广东联通 DNS", "ip": "210.21.196.6"},
+        {"name": "广东联通 DNS", "ip": "221.5.88.88"},
+        {"name": "河北联通 DNS", "ip": "202.99.160.68"},
+        {"name": "河北联通 DNS", "ip": "202.99.166.4"},
+        {"name": "河南联通 DNS", "ip": "202.102.224.68"},
+        {"name": "河南联通 DNS", "ip": "202.102.227.68"},
+        {"name": "黑龙江联通 DNS", "ip": "202.97.224.69"},
+        {"name": "黑龙江联通 DNS", "ip": "202.97.224.68"},
+        {"name": "吉林联通 DNS", "ip": "202.98.0.68"},
+        {"name": "吉林联通 DNS", "ip": "202.98.5.68"},
+        {"name": "江苏联通 DNS", "ip": "221.6.4.66"},
+        {"name": "江苏联通 DNS", "ip": "221.6.4.67"},
+        {"name": "内蒙古联通 DNS", "ip": "202.99.224.68"},
+        {"name": "内蒙古联通 DNS", "ip": "202.99.224.8"},
+        {"name": "山东联通 DNS", "ip": "202.102.128.68"},
+        {"name": "山东联通 DNS", "ip": "202.102.152.3"},
+        {"name": "山东联通 DNS", "ip": "202.102.134.68"},
+        {"name": "山东联通 DNS", "ip": "202.102.154.3"},
+        {"name": "山西联通 DNS", "ip": "202.99.192.66"},
+        {"name": "山西联通 DNS", "ip": "202.99.192.68"},
+        {"name": "陕西联通 DNS", "ip": "221.11.1.67"},
+        {"name": "陕西联通 DNS", "ip": "221.11.1.68"},
+        {"name": "上海联通 DNS", "ip": "210.22.70.3"},
+        {"name": "四川联通 DNS", "ip": "119.6.6.6"},
+        {"name": "四川联通 DNS", "ip": "124.161.87.155"},
+        {"name": "天津联通 DNS", "ip": "202.99.104.68"},
+        {"name": "天津联通 DNS", "ip": "202.99.96.68"},
+        {"name": "浙江联通 DNS", "ip": "221.12.1.227"},
+        {"name": "浙江联通 DNS", "ip": "221.12.33.227"},
+        {"name": "辽宁联通 DNS", "ip": "202.96.69.38"},
+        {"name": "辽宁联通 DNS", "ip": "202.96.64.68"},
+        {"name": "江苏移动 DNS", "ip": "221.131.143.69"},
+        {"name": "江苏移动 DNS", "ip": "112.4.0.55"},
+        {"name": "安徽移动 DNS", "ip": "211.138.180.2"},
+        {"name": "安徽移动 DNS", "ip": "211.138.180.3"},
+        {"name": "山东移动 DNS", "ip": "218.201.96.130"},
+        {"name": "山东移动 DNS", "ip": "211.137.191.26"},
+        {"name": "广东移动 DNS", "ip": "221.179.38.7"},
+        {"name": "广东移动 DNS", "ip": "120.196.165.7"},
+        {"name": "广东移动 DNS", "ip": "211.136.192.6"},
+        {"name": "广东移动 DNS", "ip": "120.196.165.24"},
     ],
     "foreign": [
         {"name": "Google DNS", "ip": "8.8.8.8"},
-        {"name": "Google DNS 2", "ip": "8.8.4.4"},
-        {"name": "Cloudflare", "ip": "1.1.1.1"},
-        {"name": "Cloudflare 2", "ip": "1.0.0.1"},
-        {"name": "Quad9", "ip": "9.9.9.9"},
+        {"name": "Google DNS", "ip": "8.8.4.4"},
+        {"name": "IBM Quad9", "ip": "9.9.9.9"},
         {"name": "OpenDNS", "ip": "208.67.222.222"},
+        {"name": "OpenDNS", "ip": "208.67.220.220"},
+        {"name": "V2EX DNS", "ip": "199.91.73.222"},
+        {"name": "V2EX DNS", "ip": "178.79.131.110"},
     ],
 }
 
+# IPv6 公共 DNS（数据源同 DnsTools 的 DnsList.v6.json，取国内运营商/公共 + 国外主流）
+DNS_V6_SERVERS = [
+    {"name": "阿里 IPv6 DNS", "ip": "2400:3200::1"},
+    {"name": "阿里 IPv6 DNS", "ip": "2400:3200:baba::1"},
+    {"name": "腾讯 DNSPod IPv6", "ip": "2402:4e00::"},
+    {"name": "百度 IPv6 DNS", "ip": "2400:da00::6666"},
+    {"name": "中国电信 IPv6 DNS", "ip": "240e:4c:4008::1"},
+    {"name": "中国电信 IPv6 DNS", "ip": "240e:4c:4808::1"},
+    {"name": "中国联通 IPv6 DNS", "ip": "2408:8899::8"},
+    {"name": "中国联通 IPv6 DNS", "ip": "2408:8888::8"},
+    {"name": "中国移动 IPv6 DNS", "ip": "2409:8088::a"},
+    {"name": "下一代互联网 CNGI", "ip": "240C::6666"},
+    {"name": "下一代互联网 CNGI", "ip": "240C::6644"},
+    {"name": "CNNIC IPv6 DNS", "ip": "2001:dc7:1000::1"},
+    {"name": "Google IPv6 DNS", "ip": "2001:4860:4860::8888"},
+    {"name": "Cloudflare IPv6 DNS", "ip": "2606:4700:4700::1111"},
+    {"name": "OpenDNS IPv6", "ip": "2620:0:ccc::2"},
+    {"name": "Quad9 IPv6 DNS", "ip": "2620:fe::fe"},
+]
+
 
 def _dns_raw_query(ip, domain="www.baidu.com", timeout=2.5):
-    """Send a minimal UDP DNS A-record query, return (ok, latency_ms, answer_ip)."""
+    """Send a minimal UDP DNS A-record query, return (ok, latency_ms, answer_ip).
+
+    与 DnsTools（Tauri + trust-dns-resolver）同底层原理：向目标 DNS 服务器
+    直发标准 UDP DNS 报文测往返延迟。自动兼容 IPv6 DNS 服务器地址。
+    """
     sock = None
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        fam = socket.AF_INET6 if ":" in ip else socket.AF_INET
+        sock = socket.socket(fam, socket.SOCK_DGRAM)
         sock.settimeout(timeout)
         qname = b"".join(bytes([len(label)]) + label.encode("utf-8")
                         for label in domain.split(".")) + b"\x00"
@@ -854,18 +1115,137 @@ def _dns_raw_query(ip, domain="www.baidu.com", timeout=2.5):
                 pass
 
 
+def _dns_probe(ip, domain, timeout=1.5, measured=3):
+    """单个 DNS 的真实延迟探测（参照 DnsTools / trust-dns-resolver 的做法）。
+
+    关键：热门域名（如 www.baidu.com）会被运营商缓存/透明拦截秒回，
+    测出来的 2ms 是假延迟。这里改为：
+      1. 正常域名查询一次 —— 验证服务器可用、拿到解析结果（同时当预热）；
+      2. 再用「随机子域名」查询 N 次 —— 任何真实解析器都必须向上游递归，
+         拿到的才是该服务器与根/权威链路的真实往返耗时；取最小值。
+    全程复用同一个已连接 socket（trust-dns 同款做法），排除建连开销。
+    """
+    fam = socket.AF_INET6 if ":" in ip else socket.AF_INET
+    try:
+        sock = socket.socket(fam, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
+        sock.connect((ip, 53))
+    except Exception:
+        return {"ok": False, "ms": None, "answer": None}
+
+    def q(name):
+        try:
+            qname = b"".join(bytes([len(label)]) + label.encode("utf-8")
+                             for label in name.split(".")) + b"\x00"
+            req = struct.pack(">HHHHHH", random.randint(0, 0xFFFF), 0x0100,
+                              1, 0, 0, 0) + qname + struct.pack(">HH", 1, 1)
+            sock.send(req)
+            data, _ = sock.recvfrom(512)
+            ms = None
+            return data
+        except Exception:
+            return None
+
+    import time as _t
+    answer = None
+    # 1) 正常查询：验证可用 + 解析结果 + 预热
+    data = q(domain)
+    if data is not None:
+        try:
+            flags = struct.unpack_from(">H", data, 2)[0]
+            ancount = struct.unpack_from(">H", data, 6)[0]
+            if (flags & 0x0F) == 0 and ancount > 0:
+                answer = _dns_parse_answer(data, domain)
+        except Exception:
+            pass
+    # 2) 随机子域名强制递归，测真实往返
+    best = None
+    for _ in range(measured):
+        rnd = "%012x.%s" % (random.getrandbits(48), domain)
+        t0 = _t.perf_counter()
+        data = q(rnd)
+        if data is not None:
+            ms = (_t.perf_counter() - t0) * 1000.0
+            if best is None or ms < best:
+                best = ms
+    try:
+        sock.close()
+    except Exception:
+        pass
+    if best is not None:
+        best = int(round(best))
+    return {"ok": data is not None, "ms": best, "answer": answer}
+
+
+def _dns_parse_answer(data, domain):
+    """从 DNS 响应里解析第一条 A 记录 IP（仅用于展示解析结果）。"""
+    try:
+        qdcount = struct.unpack_from(">H", data, 4)[0]
+        ancount = struct.unpack_from(">H", data, 6)[0]
+        idx = 12
+        for _ in range(qdcount):
+            while True:
+                length = data[idx]
+                if length & 0xC0 == 0xC0:
+                    idx += 2
+                    break
+                idx += 1
+                if length == 0:
+                    break
+                idx += length
+            idx += 4
+        for _ in range(ancount):
+            if idx + 1 >= len(data):
+                break
+            while True:
+                length = data[idx]
+                if length & 0xC0 == 0xC0:
+                    idx += 2
+                    break
+                idx += 1
+                if length == 0:
+                    break
+                idx += length
+            if idx + 10 > len(data):
+                break
+            typ, cls, ttl, rdlen = struct.unpack_from(">HHIH", data, idx)
+            idx += 10
+            if typ == 1 and rdlen == 4 and idx + 4 <= len(data):
+                return ".".join(str(b) for b in data[idx:idx + 4])
+            idx += rdlen
+    except Exception:
+        pass
+    return None
+
+
 def dns_test(mode="mixed", domain="www.baidu.com"):
-    """mode: domestic / foreign / mixed. Returns list of {name, ip, ok, ms, answer}."""
+    """mode: domestic / foreign / mixed / ipv6. Returns list of {name, ip, cat, ok, ms, answer}."""
     if mode == "domestic":
-        src = DNS_SERVERS["domestic"]
+        src = [(s, "国内") for s in DNS_SERVERS["domestic"]]
     elif mode == "foreign":
-        src = DNS_SERVERS["foreign"]
+        src = [(s, "国外") for s in DNS_SERVERS["foreign"]]
+    elif mode == "ipv6":
+        src = [(s, "IPv6") for s in DNS_V6_SERVERS]
     else:
-        src = DNS_SERVERS["domestic"] + DNS_SERVERS["foreign"]
-    out = []
-    for s in src:
-        ok, ms, answer = _dns_raw_query(s["ip"], domain)
-        out.append({"name": s["name"], "ip": s["ip"], "ok": ok, "ms": ms, "answer": answer})
+        src = [(s, "国内") for s in DNS_SERVERS["domestic"]] + \
+              [(s, "国外") for s in DNS_SERVERS["foreign"]]
+    out = [None] * len(src)
+
+    def work(i_s_cat):
+        i, s, cat = i_s_cat
+        r = _dns_probe(s["ip"], domain)
+        r.update({"name": s["name"], "ip": s["ip"], "cat": cat})
+        return i, r
+
+    # 并行探测：122 个 DNS 串行要跑一分多钟，16 线程十几秒出全量结果
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=16) as ex:
+            for i, r in ex.map(work, list(enumerate(src))):
+                out[i] = r
+    except Exception:
+        out = [work((i, s, cat))[1] for i, (s, cat) in enumerate(src)]
+    out = [r for r in out if r]
     out.sort(key=lambda x: (not x["ok"], x["ms"] if x["ms"] is not None else 9999))
     return out
 
@@ -933,30 +1313,71 @@ def ping_once(host, timeout=1500):
 # cleanup
 # --------------------------------------------------------------------------
 def junk_targets():
+    """可清理项清单。
+
+    每项带：
+      level — recommend(建议清理) / ok(可以清理) / caution(谨慎清理)
+      what  — 这些文件是什么、删了会怎样
+    """
     win = os.environ.get("SystemRoot", r"C:\Windows")
     lad = os.environ.get("LOCALAPPDATA", "")
     return [
         {"id": "user_temp", "name": "用户临时文件 (%TEMP%)",
-         "path": os.environ.get("TEMP", ""), "kind": "clear"},
+         "path": os.environ.get("TEMP", ""), "kind": "clear",
+         "level": "recommend",
+         "what": "各软件运行时产生的临时文件（安装包解包、编辑器缓存等）。"
+                 "可以放心删除，正在被占用的文件会自动跳过。"},
         {"id": "win_temp", "name": "系统临时文件 (Windows\\Temp)",
-         "path": os.path.join(win, "Temp"), "kind": "clear"},
+         "path": os.path.join(win, "Temp"), "kind": "clear",
+         "level": "recommend",
+         "what": "系统与软件安装/更新时留下的临时文件，删除安全。"},
         {"id": "prefetch", "name": "预读取文件 (Prefetch)",
-         "path": os.path.join(win, "Prefetch"), "kind": "clear"},
+         "path": os.path.join(win, "Prefetch"), "kind": "clear",
+         "level": "caution",
+         "what": "系统为加速程序启动而预生成的读取缓存（.pf）。"
+                 "删掉系统会重建，但短期内程序启动会明显变慢，一般建议保留。"},
         {"id": "wu_cache", "name": "Windows 更新缓存",
-         "path": os.path.join(win, "SoftwareDistribution", "Download"), "kind": "clear"},
+         "path": os.path.join(win, "SoftwareDistribution", "Download"), "kind": "clear",
+         "level": "recommend",
+         "what": "已下载并安装完成的更新安装包，删掉不影响已经装好的更新，通常最占空间。"},
         {"id": "wu_logs", "name": "Windows 更新日志",
-         "path": os.path.join(win, "Logs", "WindowsUpdate"), "kind": "clear"},
+         "path": os.path.join(win, "Logs", "WindowsUpdate"), "kind": "clear",
+         "level": "ok",
+         "what": "更新过程的记录日志，只在排查“更新失败”时才需要，平时可以清理。"},
         {"id": "crash", "name": "崩溃转储 / WER 报告",
-         "path": os.path.join(lad, "CrashDumps"), "kind": "clear"},
+         "path": os.path.join(lad, "CrashDumps"), "kind": "clear",
+         "level": "ok",
+         "what": "程序崩溃时生成的内存转储与错误报告，只有要追查崩溃原因时才需要保留。"},
         {"id": "thumb", "name": "缩略图缓存 (Explorer)",
-         "path": os.path.join(lad, "Microsoft", "Windows", "Explorer"), "kind": "files"},
+         "path": os.path.join(lad, "Microsoft", "Windows", "Explorer"), "kind": "files",
+         "level": "ok",
+         "what": "资源管理器为图片/视频生成的缩略图数据库。删除后会自动重建，"
+                 "只是第一次浏览大文件夹时会稍慢。"},
         {"id": "inetcache", "name": "IE / 系统网络缓存",
-         "path": os.path.join(lad, "Microsoft", "Windows", "INetCache"), "kind": "clear"},
+         "path": os.path.join(lad, "Microsoft", "Windows", "INetCache"), "kind": "clear",
+         "level": "recommend",
+         "what": "系统组件与 IE 内核的网页缓存和临时下载，删除安全。"},
         {"id": "chrome", "name": "Chrome 缓存",
-         "path": os.path.join(lad, "Google", "Chrome", "User Data", "Default", "Cache"), "kind": "clear"},
+         "path": os.path.join(lad, "Google", "Chrome", "User Data", "Default", "Cache"),
+         "kind": "clear",
+         "level": "ok",
+         "what": "Chrome 缓存的网页图片/脚本等。清理后网页首次打开会重新下载变慢；"
+                 "不含书签、密码、登录状态。"},
         {"id": "edge", "name": "Edge 缓存",
-         "path": os.path.join(lad, "Microsoft", "Edge", "User Data", "Default", "Cache"), "kind": "clear"},
+         "path": os.path.join(lad, "Microsoft", "Edge", "User Data", "Default", "Cache"),
+         "kind": "clear",
+         "level": "ok",
+         "what": "Edge 缓存的网页资源。清理后首次打开网页会重新加载；"
+                 "不影响收藏夹与登录状态。"},
     ]
+
+
+# 回收站（单独一项，说明与等级同样标注）
+JUNK_RECYCLE = {
+    "id": "recyclebin", "name": "回收站", "path": "SHELL:RecycleBin",
+    "kind": "recycle", "level": "caution",
+    "what": "回收站里是你自己删除过的文件。清空后无法找回，请先确认没有想恢复的内容。",
+}
 
 
 def dir_size(path, cap=200000):
@@ -976,22 +1397,46 @@ def dir_size(path, cap=200000):
     return total, n
 
 
-def scan_junk():
-    out = []
-    for t in junk_targets():
-        size, n = dir_size(t["path"])
-        out.append({"id": t["id"], "name": t["name"], "path": t["path"],
-                    "size": size, "files": n, "kind": t["kind"]})
-    rbin = 0
+def recycle_bin_size():
+    """回收站占用（Shell.Application COM，单独查询便于并行）。"""
     try:
         rc, o = ps("(New-Object -ComObject Shell.Application).NameSpace(0xA).Items() | "
-                   "Measure-Object -Property Size -Sum | Select-Object -ExpandProperty Sum")
-        rbin = int(float(o.strip() or 0))
+                   "Measure-Object -Property Size -Sum | Select-Object -ExpandProperty Sum",
+                   timeout=60)
+        return int(float((o or "0").strip() or 0))
     except Exception:
-        pass
-    out.append({"id": "recyclebin", "name": "回收站", "path": "SHELL:RecycleBin",
-                "size": rbin, "files": 0, "kind": "recycle"})
-    return out
+        return 0
+
+
+def junk_item_size(tid):
+    """只扫描一个垃圾项（供 UI 逐项并行统计）。"""
+    if tid == "recyclebin":
+        return dict(JUNK_RECYCLE, size=recycle_bin_size(), files=0)
+    for t in junk_targets():
+        if t["id"] != tid:
+            continue
+        size, n = dir_size(t["path"])
+        return dict(t, size=size, files=n)
+    return None
+
+
+def scan_junk():
+    """全量扫描（并行）。UI 目前用 junk_item_size 逐项显示，此函数保留作兜底。"""
+    tids = [t["id"] for t in junk_targets()] + ["recyclebin"]
+    out = {}
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            for r in ex.map(junk_item_size, tids):
+                if r:
+                    out[r["id"]] = r
+    except Exception:
+        for t in tids:
+            r = junk_item_size(t)
+            if r:
+                out[r["id"]] = r
+    order = [t["id"] for t in junk_targets()] + ["recyclebin"]
+    return [out[i] for i in order if i in out]
 
 
 def clean_junk(ids):
@@ -1106,19 +1551,28 @@ def policies_scan():
 
 
 def policies_fix(paths):
+    """清除策略残留：每个键先 reg export 备份到 BACKUP 目录，再删除。"""
     stamp = time.strftime("%Y%m%d_%H%M%S")
     results = []
+    backups = []
+    try:
+        os.makedirs(BACKUP, exist_ok=True)
+    except OSError:
+        pass
     for p in paths:
         safe = p.replace("\\", "_")
         outfile = os.path.join(BACKUP, "policy_%s_%s.reg" % (safe, stamp))
         run(["reg", "export", p, outfile, "/y"])
         rc, out = run(["reg", "delete", p, "/f"])
-        results.append({"path": p, "ok": rc == 0, "backup": outfile if rc == 0 else None})
+        if os.path.exists(outfile):
+            backups.append(outfile)
+        results.append({"path": p, "ok": rc == 0,
+                        "backup": outfile if os.path.exists(outfile) else None})
     # the pause-to-2999 values live outside Policies, delete them individually
     for path, names, why in POLICY_EXTRA_VALUES:
         for nm in names:
             run(["reg", "delete", path, "/v", nm, "/f"])
-    return results
+    return {"results": results, "backups": backups, "backup_dir": BACKUP}
 
 
 # --------------------------------------------------------------------------
@@ -1228,6 +1682,395 @@ def _nvidia_smi():
                         pass
                 return gpus
     return []
+
+
+# --------------------------------------------------------------------------
+# 全显卡（多 GPU）：PDH「GPU Engine」计数器（所有厂商通用，任务管理器同款）
+# + HKLM\SOFTWARE\Microsoft\DirectX 的 AdapterLuid -> 显卡名 映射
+# --------------------------------------------------------------------------
+def _dx_adapters():
+    """返回 {AdapterLuid(int): 显卡名}。DirectX 子键每个适配器一条，含 AdapterLuid。"""
+    import winreg
+    out = {}
+    try:
+        k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\DirectX")
+    except OSError:
+        return out
+    i = 0
+    while True:
+        try:
+            sub = winreg.EnumKey(k, i)
+        except OSError:
+            break
+        i += 1
+        try:
+            sk = winreg.OpenKey(k, sub)
+            try:
+                name = winreg.QueryValueEx(sk, "Description")[0]
+                luid = int(winreg.QueryValueEx(sk, "AdapterLuid")[0])
+                out[luid] = name
+            except OSError:
+                pass
+            finally:
+                winreg.CloseKey(sk)
+        except OSError:
+            continue
+    winreg.CloseKey(k)
+    return out
+
+
+def _gpu_luid_of(inst_name):
+    """'pid_1_luid_0x00000000_0x00013819_phys_0_...' -> int64 LUID。"""
+    m = re.search(r"luid_0x([0-9A-Fa-f]{8})_0x([0-9A-Fa-f]{8})", inst_name)
+    if not m:
+        return None
+    return (int(m.group(1), 16) << 32) | int(m.group(2), 16)
+
+
+# 只取 3D 引擎实例（任务管理器的 GPU 占用口径），避免几百个实例拖慢采样
+_GPU_ENGINE_TYPES = ("engtype_3D",)
+_gpu_conn = {"t": 0.0, "q": None, "luids": []}
+_GPU_CONN_TTL = 120.0
+_gpu_conn_lock = threading.Lock()
+
+
+def _gpu_engine_utils():
+    """1s 采样：返回 {luid_int: 占用%}。刚建查询的首秒返回 {}（无基线）。"""
+    if _pdh is None:
+        return {}
+    now = time.time()
+    with _gpu_conn_lock:
+        if now - _gpu_conn["t"] > _GPU_CONN_TTL or _gpu_conn["q"] is None:
+            if _gpu_conn["q"]:
+                _gpu_conn["q"].close()
+                _gpu_conn["q"] = None
+            insts = [i for i in pdh_instances("GPU Engine")
+                     if any(t in i for t in _GPU_ENGINE_TYPES)][:256]
+            q = _PdhQuery(["\\GPU Engine(%s)\\Utilization Percentage" % i
+                           for i in insts])
+            luids = sorted({l for l in (_gpu_luid_of(i) for i in insts)
+                            if l is not None})
+            if q.open():
+                _gpu_conn.update(t=now, q=q, luids=luids)
+            else:
+                _gpu_conn.update(t=now, q=None, luids=[])
+                return {}
+            return {}          # 首个样本只做基线
+        vals = _gpu_conn["q"].collect_and_read()
+    agg = {}
+    for p, v in vals.items():
+        if v:
+            lu = _gpu_luid_of(p)
+            if lu is not None:
+                agg[lu] = min(100.0, agg.get(lu, 0.0) + float(v))
+    return agg
+
+
+def _gpu_base():
+    """8s：全显卡名单。{index, name, luid, temp, nv_util}（nv_util 是 NVIDIA 兜底占用）。"""
+    nv = _nvidia_smi()
+    adapters = _dx_adapters()
+    out = []
+    for lu in _gpu_conn["luids"] or []:
+        name = adapters.get(lu)
+        if not name or "Microsoft Basic Render" in name:   # WARP 软渲染不是真显卡
+            continue
+        e = {"name": name, "luid": lu, "temp": None, "nv_util": None}
+        for g in nv:
+            if g["name"].strip().lower() in name.strip().lower():
+                e["temp"] = g.get("temp")
+                e["nv_util"] = g.get("util")
+        out.append(e)
+    # nvidia-smi 有、但引擎实例没出现的（驱动刚加载等），兜底补上
+    for g in nv:
+        if not any(g["name"].strip().lower() in e["name"].lower() for e in out):
+            out.append({"name": g["name"], "luid": None, "temp": g.get("temp"),
+                        "nv_util": g.get("util")})
+    if not out:
+        agg = _gpu_aggregate_cached()
+        if agg is not None:
+            out = [{"name": "GPU（聚合）", "luid": None, "temp": None,
+                    "nv_util": int(round(agg))}]
+    for i, e in enumerate(out):
+        e["index"] = i
+    return out
+
+
+# --------------------------------------------------------------------------
+# CPU 调试：大小核拓扑 / 电源计划 / 处理器状态 / EPP / 进程亲和 / E-core 开关
+# --------------------------------------------------------------------------
+def cpu_topology():
+    """用 GetLogicalProcessorInformationEx 拿每个物理核的 EfficiencyClass。
+
+    EfficiencyClass 越大越"性能核"（Intel 混合架构：P核=1，E核=0）。
+    返回 {"logical": n, "cores": [...], "p_logicals": [...], "e_logicals": [...],
+          "base_mhz": int, "name": str}
+    """
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    GLPIE = k32.GetLogicalProcessorInformationEx
+    GLPIE.restype = wt.BOOL
+    GLPIE.argtypes = [wt.DWORD, ctypes.c_void_p, ctypes.POINTER(wt.DWORD)]
+
+    RelationProcessorCore = 0
+    size = wt.DWORD(0)
+    GLPIE(RelationProcessorCore, None, ctypes.byref(size))
+    buf = ctypes.create_string_buffer(size.value)
+    if not GLPIE(RelationProcessorCore, buf, ctypes.byref(size)):
+        return None
+    # SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX (x64):
+    #   0: Relationship(DWORD)  4: Size(DWORD)  8: PROCESSOR_RELATIONSHIP
+    #   PROCESSOR_RELATIONSHIP: +0 Flags(B) +1 EfficiencyClass(B) +22 GroupCount(W)
+    #   +24 GROUP_AFFINITY { Mask(ULONG_PTR), Group(WORD) }
+    MASK = (1 << ctypes.sizeof(ctypes.c_void_p) * 8) - 1
+    off = 0
+    raw = buf.raw
+    end = size.value
+    cores = []
+    logical_index = 0
+    while off + 8 <= end:
+        rel, esize = struct.unpack_from("<II", raw, off)
+        if esize <= 0:
+            break
+        if rel == 0:  # ProcessorCore
+            eff = raw[off + 8 + 1]
+            mask = int.from_bytes(raw[off + 8 + 24: off + 8 + 24 + ctypes.sizeof(ctypes.c_void_p)],
+                                  "little")
+            logicals = []
+            m = mask
+            bit = 0
+            while m:
+                if m & 1:
+                    logicals.append(bit)
+                m >>= 1
+                bit += 1
+            # 掩码位是全局逻辑处理器编号（单组系统）
+            cores.append({"efficiency": eff, "mask": mask, "logicals": logicals})
+            logical_index += len(logicals)
+        off += (esize + 7) & ~7  # 8 字节对齐
+    p_logicals, e_logicals = [], []
+    for c in cores:
+        (p_logicals if c["efficiency"] > 0 else e_logicals).extend(c["logicals"])
+    name, mhz = "", 0
+    try:
+        k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                           r"HARDWARE\DESCRIPTION\System\CentralProcessor\0")
+        name = winreg.QueryValueEx(k, "ProcessorNameString")[0]
+        mhz = int(winreg.QueryValueEx(k, "~MHz")[0])
+        winreg.CloseKey(k)
+    except OSError:
+        pass
+    all_l = sorted(l for c in cores for l in c["logicals"])
+    return {"logical": len(all_l), "cores": cores,
+            "p_logicals": p_logicals, "e_logicals": e_logicals,
+            "p_cores": len([c for c in cores if c["efficiency"] > 0]),
+            "e_cores": len([c for c in cores if c["efficiency"] == 0]),
+            "base_mhz": mhz, "name": name}
+
+
+def cpu_plans():
+    """powercfg /list -> [{'guid','name','active'}]，并附当前活跃计划。"""
+    rc, out = run(["powercfg", "/list"], timeout=30)
+    plans = []
+    for line in (out or "").splitlines():
+        m = re.search(r"([0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12})\s+(?:\((.+?)\))?", line)
+        if not m:
+            continue
+        plans.append({"guid": m.group(1), "name": (m.group(2) or "").strip(),
+                      "active": "*" in line or "*" in line})
+    return plans
+
+
+def cpu_set_plan(guid):
+    rc, out = run(["powercfg", "/setactive", guid], timeout=30)
+    return {"ok": rc == 0, "err": (out or "").strip()[:120]}
+
+
+# 隐藏的 Speed Shift EPP 阈值（0=最高性能，100=最高能效）
+_EPP_GUID = "36687f9e-e3a5-4dbf-b1dc-15eb381c6863"
+_PROC_SUB = "SUB_PROCESSOR"
+
+
+def _powercfg_set_hidden():
+    run(["powercfg", "-attributes", _PROC_SUB, _EPP_GUID, "-ATTRIB_HIDE"], timeout=30)
+
+
+def _parse_q_processor(scheme="SCHEME_CURRENT"):
+    """powercfg -q <scheme> SUB_PROCESSOR -> {设置GUID: AC值}"""
+    rc, out = run(["powercfg", "-q", scheme, _PROC_SUB], timeout=60)
+    vals = {}
+    cur = None
+    for line in (out or "").splitlines():
+        line = line.strip()
+        m = re.search(r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})", line)
+        if "电源设置 GUID" in line or "Power Setting GUID" in line or m:
+            if m:
+                cur = m.group(1)
+            continue
+        m2 = re.search(r"(?:当前交流电源设置索引|Current AC Power Setting Index)\s*:\s*(0x[0-9a-fA-F]+)", line)
+        if m2 and cur:
+            vals[cur] = int(m2.group(1), 16)
+    return vals
+
+
+def _is_guid(s):
+    return bool(s and re.match(r"^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$", s))
+
+
+_PROC_GUIDS = {
+    "min": "893dee8e-2bef-41e0-89c6-b55d0929964c",   # 处理器最小状态 %
+    "max": "bc5038f7-23e0-4960-96da-33abaf5935ec",   # 处理器最大状态 %
+    "epp": _EPP_GUID,                                 # EPP 能效偏好
+}
+
+
+def cpu_proc_states(guid=None):
+    """读取指定电源计划的处理器参数（不传则读当前生效计划）。"""
+    scheme = guid if _is_guid(guid) else "SCHEME_CURRENT"
+    _powercfg_set_hidden()
+    vals = _parse_q_processor(scheme)
+    return {k: vals.get(g) for k, g in _PROC_GUIDS.items()}
+
+
+def cpu_set_state(kind, value, guid=None):
+    """设置处理器最小/最大状态(0-100)或 EPP(0-100)。
+
+    guid 为空或为当前生效计划时：写入并立即生效（setactive 应用）；
+    指定其他计划时：只写入该计划，等它被激活时才生效。
+    """
+    g = _PROC_GUIDS.get(kind)
+    if not g:
+        return {"ok": False, "err": "未知参数"}
+    if kind == "epp":
+        _powercfg_set_hidden()
+    scheme = guid if _is_guid(guid) else "scheme_current"
+    rc1, o1 = run(["powercfg", "-setacvalueindex", scheme, _PROC_SUB,
+                   g, str(int(value))], timeout=30)
+    # 仅当目标是当前计划才需要 setactive 让参数立即生效；
+    # 对其它计划 setactive 会把它切为当前计划，必须避免
+    if scheme == "scheme_current":
+        rc2, o2 = run(["powercfg", "-setactive", "scheme_current"], timeout=30)
+    else:
+        rc2, o2 = 0, ""
+    ok = rc1 == 0 and rc2 == 0
+    return {"ok": ok, "err": "" if ok else ((o1 or o2 or "").strip()[:120])}
+
+
+def cpu_per_core():
+    """1s：每逻辑处理器占用(%) 与 实时频率(MHz)（PDH，任务管理器同源）。"""
+    conn = _cpu_conn_get()
+    q = conn.get("q")
+    if not q:
+        return None
+    vals = q.collect_and_read()
+    base = conn.get("base_mhz") or 0
+    cores = []
+    for inst in conn.get("insts") or []:
+        util = vals.get("\\Processor Information(%s)\\%% Processor Utility" % inst)
+        perf = vals.get("\\Processor Information(%s)\\%% Processor Performance" % inst)
+        try:
+            idx = int(inst.split(",")[-1])
+        except Exception:
+            idx = -1
+        freq = base * (perf or 0.0) / 100.0 if perf is not None else None
+        cores.append({"id": idx, "util": util, "mhz": freq})
+    cores.sort(key=lambda c: c["id"])
+    return {"cores": cores, "base_mhz": base}
+
+
+_cpu_conn = {"t": 0.0, "q": None, "insts": [], "base_mhz": 0}
+_CPU_CONN_TTL = 120.0
+_cpu_lock = threading.Lock()
+
+
+def _cpu_conn_get():
+    now = time.time()
+    with _cpu_lock:
+        if now - _cpu_conn["t"] <= _CPU_CONN_TTL and _cpu_conn["q"] is not None:
+            return _cpu_conn
+        if _cpu_conn["q"]:
+            _cpu_conn["q"].close()
+            _cpu_conn["q"] = None
+        insts = [i for i in pdh_instances("Processor Information")
+                 if re.match(r"^\d+,\d+$", i)]
+        paths = []
+        for i in insts:
+            paths.append("\\Processor Information(%s)\\%% Processor Utility" % i)
+            paths.append("\\Processor Information(%s)\\%% Processor Performance" % i)
+        q = _PdhQuery(paths)
+        base = 0
+        try:
+            k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                               r"HARDWARE\DESCRIPTION\System\CentralProcessor\0")
+            base = int(winreg.QueryValueEx(k, "~MHz")[0])
+            winreg.CloseKey(k)
+        except OSError:
+            pass
+        if q.open():
+            _cpu_conn.update(t=now, q=q, insts=insts, base_mhz=base)
+        else:
+            _cpu_conn.update(t=now, q=None, insts=[], base_mhz=base)
+        return _cpu_conn
+
+
+def set_process_affinity(pid, target):
+    """把进程绑定到 P 核 / E 核 / 全部核心。target: 'P' | 'E' | 'ALL'。"""
+    topo = cpu_topology()
+    if not topo:
+        return {"ok": False, "err": "无法读取 CPU 拓扑"}
+    if target == "P":
+        logicals = topo["p_logicals"]
+    elif target == "E":
+        logicals = topo["e_logicals"]
+    else:
+        logicals = list(range(topo["logical"]))
+    if not logicals:
+        return {"ok": False, "err": "该组核心为空（本机可能没有大小核）"}
+    mask = 0
+    for l in logicals:
+        mask |= (1 << l)
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    PROCESS_SET_INFORMATION = 0x0200
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    h = k32.OpenProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION,
+                        False, int(pid))
+    if not h:
+        return {"ok": False, "err": "OpenProcess 失败（权限/系统进程）"}
+    try:
+        r = k32.SetProcessAffinityMask(ctypes.c_void_p(h), ctypes.c_size_t(mask))
+        if not r:
+            return {"ok": False, "err": "SetProcessAffinityMask 失败"}
+        return {"ok": True, "mask": mask}
+    finally:
+        k32.CloseHandle(ctypes.c_void_p(h))
+
+
+def ecore_status():
+    """读 bcdedit 当前 numproc（E-core 全局禁用开关的状态）。"""
+    rc, out = run(["bcdedit", "/enum", "{current}"], timeout=30)
+    m = re.search(r"numproc\s+(0x[0-9a-fA-F]+|\d+)", out or "", re.I)
+    if m:
+        v = m.group(1)
+        return {"set": True, "numproc": int(v, 16) if v.startswith("0x") else int(v)}
+    return {"set": False, "numproc": None}
+
+
+def ecore_disable():
+    """全局禁用 E-core：bcdedit 设 numproc = P 核逻辑处理器数（需重启生效）。"""
+    topo = cpu_topology()
+    if not topo or not topo["p_logicals"]:
+        return {"ok": False, "err": "未检测到 P 核（本机可能不是大小核架构）"}
+    n = len(topo["p_logicals"])
+    rc, out = run(["bcdedit", "/set", "{current}", "numproc", str(n)], timeout=30)
+    ok = rc == 0
+    return {"ok": ok, "numproc": n if ok else None,
+            "err": "" if ok else (out or "").strip()[:120]}
+
+
+def ecore_restore():
+    """恢复全部核心：删除 numproc 启动项（需重启生效）。"""
+    rc, out = run(["bcdedit", "/deletevalue", "{current}", "numproc"], timeout=30)
+    ok = rc == 0
+    return {"ok": ok, "err": "" if ok else (out or "").strip()[:120]}
 
 
 def _perf_script():
@@ -2128,18 +2971,14 @@ def _fast_fetch():
         disks = _wmi_perf_fallback()
         agg = (sum((d["util"] or 0) for d in disks) / len(disks)) if disks else None
     return {"cpu_temp": cpu_temp(), "disks": disks, "disk": agg,
-            "gpu": _gpu_aggregate_cached(), "gpu_temp": None, "gpus": [],
+            "gpu": _gpu_aggregate_cached(), "gpu_temp": None,
+            "gpu_utils": _gpu_engine_utils(), "gpus": [],
             "realtime": True}
 
 
 def _slow_fetch():
-    """8 秒级：nvidia-smi 明细（含温度/显存），失败时用 GPU 聚合占位。"""
-    gpus = _nvidia_smi()
-    if not gpus:
-        agg = _gpu_aggregate_cached()
-        if agg is not None:
-            gpus = [{"index": 0, "name": "GPU0 (聚合)",
-                     "util": int(round(agg)), "temp": None}]
+    """8 秒级：全显卡名单（PDH 引擎 LUID + nvidia-smi 温度/兜底占用）。"""
+    gpus = _gpu_base()
     gpu_temp = next((g["temp"] for g in gpus if g.get("temp") is not None), None)
     return {"gpus": gpus, "gpu_temp": gpu_temp}
 
@@ -2173,11 +3012,15 @@ def perf_stats():
 
     data = dict(fast)
     data.update(slow)
-    # GPU 聚合优先用 nvidia-smi 明细的平均值（更准），没有才用 fast 里的
+    # 每块 GPU 的实时占用：PDH GPU Engine（全厂商通用）优先，NVIDIA 无 PDH 时用 nvidia-smi 兜底
+    utils = data.get("gpu_utils") or {}
     if data.get("gpus"):
-        data["gpu"] = max(0.0, min(100.0,
-                                   sum((g["util"] or 0) for g in data["gpus"]) /
-                                   float(len(data["gpus"]))))
+        for g in data["gpus"]:
+            live = utils.get(g["luid"]) if g.get("luid") is not None else None
+            g["util"] = live if live is not None else g.get("nv_util")
+        vals = [g["util"] for g in data["gpus"] if g.get("util") is not None]
+        if vals:
+            data["gpu"] = max(0.0, min(100.0, sum(vals) / float(len(vals))))
     return data
 
 
