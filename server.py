@@ -246,8 +246,85 @@ def cpu_percent():
     return max(0.0, min(100.0, (total - di) * 100.0 / total))
 
 
+_SYS_BASIC = {"v": None}
+
+# Windows 功能更新代号：build number → 发布名（注册表读不到 DisplayVersion 时兜底）
+_WIN_RELEASE_BY_BUILD = {
+    10240: "1507", 10586: "1511", 14393: "1607", 15063: "1703",
+    16299: "1709", 17134: "1803", 17763: "1809", 18362: "1903",
+    18363: "1909", 19041: "2004", 19042: "20H2", 19043: "21H1",
+    19044: "21H2", 19045: "22H2",
+    22000: "21H2", 22621: "22H2", 22631: "23H2",
+    26100: "24H2", 26200: "25H2",
+}
+
+
+def os_release():
+    """Windows 功能更新代号 + 完整内部版本号，如 ("25H2", "26200.9168")。
+
+    优先读注册表 DisplayVersion（微软维护的权威值，Win10 1903 起才有）；
+    读不到时用 build number 查表兜底。两者都没有就返回 ("", "")。
+    """
+    rel, build, ubr = "", 0, 0
+    if winreg is not None:
+        try:
+            k = winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"SOFTWARE\Microsoft\Windows NT\CurrentVersion",
+                0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY)
+            try:
+                def q(n):
+                    try:
+                        return winreg.QueryValueEx(k, n)[0]
+                    except OSError:
+                        return None
+                rel = str(q("DisplayVersion") or "").strip()
+                build = int(q("CurrentBuildNumber") or q("CurrentBuild") or 0)
+                ubr = int(q("UBR") or 0)
+            finally:
+                winreg.CloseKey(k)
+        except Exception:
+            pass
+    if not rel and build:
+        rel = _WIN_RELEASE_BY_BUILD.get(build, "")
+    return rel, (("%d.%d" % (build, ubr)) if build else "")
+
+
+def cpu_base_mhz():
+    """CPU 标称基准频率(MHz)：CallNtPowerInformation 的 MaxMhz（任务管理器「基准速度」同源）。
+
+    注册表 ~MHz 在 Win11 上会跟随当前频率浮动，不可作基准值来源；API 失败时才退回它。
+    """
+    try:
+        class _PPI(ctypes.Structure):
+            _fields_ = [("Number", wt.ULONG), ("MaxMhz", wt.ULONG),
+                        ("CurrentMhz", wt.ULONG), ("MhzLimit", wt.ULONG),
+                        ("MaxIdleState", wt.ULONG), ("CurrentIdleState", wt.ULONG)]
+        arr = (_PPI * (os.cpu_count() or 1))()
+        rc = ctypes.windll.powrprof.CallNtPowerInformation(11, None, 0, arr, ctypes.sizeof(arr))
+        if rc == 0 and arr[0].MaxMhz:
+            return int(arr[0].MaxMhz)
+    except Exception:
+        pass
+    if winreg is not None:
+        try:
+            k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                               r"HARDWARE\DESCRIPTION\System\CentralProcessor\0")
+            v = int(winreg.QueryValueEx(k, "~MHz")[0])
+            winreg.CloseKey(k)
+            return v
+        except OSError:
+            pass
+    return 0
+
+
 def sys_basic():
-    """One PowerShell round-trip instead of three (keeps /api/sysinfo fast)."""
+    """One PowerShell round-trip instead of three (keeps /api/sysinfo fast).
+
+    首次约 1.8s，之后进程内缓存直接返回（OS 版本 / CPU / 核数开机后不会变）。
+    """
+    if _SYS_BASIC["v"] is not None:
+        return _SYS_BASIC["v"]
     rc, out = ps("$o=Get-CimInstance Win32_OperatingSystem; "
                  "$p=Get-CimInstance Win32_Processor | Select-Object -First 1; "
                  "'{0}|||{1}|||{2}|||{3}|||{4}|||{5}' -f $o.Caption,$o.Version,$o.OSArchitecture,"
@@ -259,8 +336,16 @@ def sys_basic():
         cores, logical = int(f[4]), int(f[5])
     except Exception:
         cores = logical = os.cpu_count() or 1
-    return {"caption": f[0].strip(), "version": f[1].strip(), "arch": f[2].strip(),
-            "cpu": f[3].strip() or "Unknown CPU", "cores": cores, "logical": logical}
+    res = {"caption": f[0].strip(), "version": f[1].strip(), "arch": f[2].strip(),
+           "cpu": f[3].strip() or "Unknown CPU", "cores": cores, "logical": logical}
+    # CPU 标称基准频率（任务管理器「基准速度」同源：CallNtPowerInformation 的 MaxMhz；
+    # 注册表 ~MHz 在 Win11 上会跟随当前频率浮动，仅作兜底）
+    res["base_mhz"] = cpu_base_mhz()
+    # 功能更新代号（24H2 / 25H2…）+ 完整内部版本号（26200.9168）
+    rel, full = os_release()
+    res["release"], res["build_full"] = rel, full
+    _SYS_BASIC["v"] = res
+    return res
 
 
 def disks():
@@ -449,6 +534,30 @@ UNINSTALL_ROOTS = [
 ]
 
 
+# 名称关键词：命中即视为系统组件（运行库 / SDK / 更新补丁 等）
+_SYS_NAME_HINTS = ("visual c++", "redistributable", ".net ", "windows sdk",
+                   "windows software development kit", "运行库", "runtime",
+                   "update for", "hotfix", "driver")
+
+
+def _app_kind(name, publisher, sys_comp, parent=""):
+    """区分「系统自带 / 商店」与「自己安装」的软件。
+
+    系统类判定（任一命中）：SystemComponent=1（驱动/运行库/系统组件）、有 ParentKeyName、
+    发行商是 Microsoft / Windows、名称里带运行库 / SDK / 更新之类关键词。
+    """
+    pub = (publisher or "").strip().lower()
+    low = (name or "").strip().lower()
+    if sys_comp in (1, "1") or parent:
+        return "system"
+    if "microsoft" in pub or pub in ("windows", "microsoft windows"):
+        return "system"
+    for kw in _SYS_NAME_HINTS:
+        if kw in low:
+            return "system"
+    return "user"
+
+
 def list_software():
     out = []
     if winreg is None:
@@ -468,23 +577,23 @@ def list_software():
                                 except OSError:
                                     return default
                             dn = q("DisplayName")
-                            if not dn:
-                                continue
-                            if q("SystemComponent", 0) in (1, "1"):
-                                continue
-                            if q("ParentKeyName"):
-                                continue
+                            if not dn or dn.startswith("${{") or dn.startswith("${"):
+                                continue      # NVIDIA 等未解析的 ARP 变量名，不是真名字
+                            pub = q("Publisher") or ""
+                            # 系统组件不再跳过：标记成 system，交给 UI 分类显示
                             out.append({
                                 "key": hive + "\\" + sub + "\\" + name,
                                 "name": dn,
                                 "version": q("DisplayVersion"),
-                                "publisher": q("Publisher"),
+                                "publisher": pub,
                                 "size": q("EstimatedSize", 0),
                                 "date": q("InstallDate"),
                                 "uninstall": q("UninstallString"),
                                 "quiet": q("QuietUninstallString"),
                                 "location": q("InstallLocation"),
                                 "icon": q("DisplayIcon"),
+                                "kind": _app_kind(dn, pub, q("SystemComponent", 0),
+                                                  q("ParentKeyName")),
                             })
                     except OSError:
                         continue
@@ -636,6 +745,20 @@ def residual_clean(files, regs):
     return {"ok": ok, "msg": msgs}
 
 
+def _exe_from_path(cmd):
+    """从命令行 / 路径里提取可执行文件路径（供 UI 显示图标）。"""
+    c = (cmd or "").strip()
+    if not c:
+        return ""
+    if c.startswith('"'):
+        end = c.find('"', 1)
+        p = c[1:end] if end > 0 else c.strip('"')
+    else:
+        p = c.split(" ")[0]
+    p = os.path.expandvars(p).strip().strip('"')
+    return p if os.path.isfile(p) else ""
+
+
 def list_startup():
     items = []
     if winreg is None:
@@ -648,7 +771,8 @@ def list_startup():
                 for i in range(n):
                     try:
                         nm, val, _ = winreg.EnumValue(k, i)
-                        items.append({"hive": hive, "path": sub, "name": nm, "cmd": val})
+                        items.append({"hive": hive, "path": sub, "name": nm,
+                                      "cmd": val, "exe": _exe_from_path(val)})
                     except OSError:
                         continue
         except FileNotFoundError:
@@ -660,21 +784,26 @@ def list_startup():
     for fd in folders:
         if os.path.isdir(fd):
             for f in os.listdir(fd):
-                items.append({"hive": "DIR", "path": fd, "name": f, "cmd": os.path.join(fd, f)})
+                full = os.path.join(fd, f)
+                items.append({"hive": "DIR", "path": fd, "name": f,
+                              "cmd": full, "exe": full if os.path.isfile(full) else ""})
     return items
 
 
 def list_services():
     """Single CIM query — much faster than one Get-CimInstance per service."""
     rc, out = ps("Get-CimInstance Win32_Service | ForEach-Object { "
-                 "'{0}|||{1}|||{2}|||{3}' -f $_.Name,$_.DisplayName,$_.State,$_.StartMode }",
+                 "'{0}|||{1}|||{2}|||{3}|||{4}' -f $_.Name,$_.DisplayName,$_.State,"
+                 "$_.StartMode,$_.PathName }",
                  timeout=120)
     res = []
     for line in out.splitlines():
         p = line.strip().split("|||")
-        if len(p) == 4 and p[0]:
+        if len(p) >= 4 and p[0]:
             res.append({"name": p[0], "display": p[1], "status": p[2],
-                        "start": {"Auto": "自动", "Manual": "手动", "Disabled": "禁用"}.get(p[3], p[3])})
+                        "start": {"Auto": "自动", "Manual": "手动",
+                                  "Disabled": "禁用"}.get(p[3], p[3]),
+                        "exe": (p[4].strip() if len(p) > 4 else "")})
     res.sort(key=lambda x: (x["start"] != "禁用", x["name"].lower()))
     return res
 
@@ -693,6 +822,34 @@ def set_service(name, action):
     else:
         return False, "unknown action"
     return rc == 0, o.strip()[:200]
+
+
+def list_tasks():
+    """计划任务（任务计划程序）：名称 / 路径 / 状态 / 执行程序（供显示图标）。"""
+    rc, out = ps("Get-ScheduledTask | ForEach-Object { "
+                 "$a=$_.Actions|Select-Object -First 1;"
+                 "'{0}|||{1}|||{2}|||{3}' -f $_.TaskName,$_.TaskPath,$_.State,"
+                 "$(if($a){[string]$a.Execute}else{''}) }",
+                 timeout=120)
+    state_cn = {"Ready": "就绪", "Running": "运行中", "Disabled": "已禁用",
+                "Queued": "排队中", "Unknown": "未知"}
+    res = []
+    for line in (out or "").splitlines():
+        p = line.strip().split("|||")
+        if len(p) >= 3 and p[0]:
+            res.append({"name": p[0], "path": p[1] or "\\",
+                        "state": state_cn.get(p[2], p[2] or "未知"),
+                        "exe": (p[3].strip() if len(p) > 3 else "")})
+    # 已禁用的排后面，其余按名称排
+    res.sort(key=lambda x: (x["state"] == "已禁用", x["name"].lower()))
+    return res
+
+
+def set_task(full_name, enable):
+    """启用 / 禁用计划任务。full_name 形如 \\Microsoft\\Windows\\...\\任务名。"""
+    rc, o = run(["schtasks", "/change", "/tn", full_name,
+                 "/enable" if enable else "/disable"], timeout=60)
+    return rc == 0, (o or "").strip()[:200]
 
 
 def _svc_start(name):
@@ -753,22 +910,77 @@ def set_defender(enabled):
 # --------------------------------------------------------------------------
 # process / memory
 # --------------------------------------------------------------------------
-def list_processes(limit=60):
-    rc, out = run(["tasklist", "/fo", "csv", "/nh"], timeout=30)
+def list_processes(limit=200):
+    """进程列表：名称 / PID / 内存 / exe / CPU% / GPU%。
+
+    一次 CIM 调用同时取回进程信息与 CPU 占用
+    （`Win32_PerfFormattedData_PerfProc_Process.PercentProcessorTime` 是「占单核百分比」，
+    除以逻辑核数换算成任务管理器口径）；GPU 占用取自 PDH GPU Engine（按 pid 聚合）。
+    CIM 不可用时退回 tasklist（此时没有 exe / CPU / GPU）。
+    """
+    temp_sampler_start()      # GPU per-pid 占用靠常驻采样线程喂养，这里确保它已启动
     procs = []
-    for line in out.splitlines():
-        line = line.strip()
-        if not line.startswith('"'):
+    script = ("$perf=@{};"
+              "Get-CimInstance Win32_PerfFormattedData_PerfProc_Process "
+              "-ErrorAction SilentlyContinue | ForEach-Object { "
+              "$perf[[int]$_.IDProcess]=$_.PercentProcessorTime };"
+              "Get-CimInstance Win32_Process | ForEach-Object { "
+              "'{0}|||{1}|||{2}|||{3}|||{4}' -f $_.Name,$_.ProcessId,"
+              "$_.WorkingSetSize,$_.ExecutablePath,$perf[[int]$_.ProcessId] }")
+    rc, out = ps(script, timeout=120)
+    ncpu = max(1, os.cpu_count() or 1)
+    for line in (out or "").splitlines():
+        p = line.strip().split("|||")
+        if len(p) < 3 or not p[0]:
             continue
-        m = re.findall(r'"([^"]*)"', line)
-        if len(m) < 5:
-            continue
-        name, pid, _, _, mem = m[0], m[1], m[2], m[3], m[4]
         try:
-            mem_kb = int(re.sub(r"[^\d]", "", mem) or 0)
+            pid = int(p[1])
         except Exception:
-            mem_kb = 0
-        procs.append({"name": name, "pid": int(pid), "mem": mem_kb * 1024})
+            continue
+        try:
+            mem = int(p[2] or 0)
+        except Exception:
+            mem = 0
+        cpu = None
+        if len(p) > 4 and p[4].strip():
+            try:
+                cpu = max(0.0, min(100.0, float(p[4]) / ncpu))
+            except Exception:
+                cpu = None
+        procs.append({"name": p[0], "pid": pid, "mem": mem,
+                      "exe": (p[3].strip() if len(p) > 3 else ""),
+                      "cpu": cpu, "gpu": None})
+    if not procs:                       # CIM 不可用时退回 tasklist
+        rc, out = run(["tasklist", "/fo", "csv", "/nh"], timeout=30)
+        for line in out.splitlines():
+            line = line.strip()
+            if not line.startswith('"'):
+                continue
+            m = re.findall(r'"([^"]*)"', line)
+            if len(m) < 5:
+                continue
+            try:
+                mem_kb = int(re.sub(r"[^\d]", "", m[4]) or 0)
+            except Exception:
+                mem_kb = 0
+            try:
+                procs.append({"name": m[0], "pid": int(m[1]),
+                              "mem": mem_kb * 1024, "exe": "",
+                              "cpu": None, "gpu": None})
+            except Exception:
+                continue
+    # GPU 占用取 PDH GPU Engine 的「按进程聚合」，由常驻采样线程持续更新。
+    # 注意：这里不能连调两次 _gpu_engine_utils() —— PDH 是速率计数器，两次采样必须间隔
+    # ≥1 秒；立刻连调只会拿到空/全 0 的结果，还会把已有缓存覆盖掉。
+    # 采样链路已建立时（_gpu_conn["last"] 非 None），没出现在聚合里的进程 = 0.0%
+    # （任务管理器口径），显示 0.0% 而不是「—」。
+    gpu_ok = _gpu_conn.get("last") is not None
+    for p in procs:
+        v = _GPU_BY_PID.get(p["pid"])
+        if v:
+            p["gpu"] = round(v, 1)
+        elif gpu_ok:
+            p["gpu"] = 0.0
     procs.sort(key=lambda x: -x["mem"])
     return procs[:limit]
 
@@ -1684,6 +1896,21 @@ def _nvidia_smi():
     return []
 
 
+# nvidia-smi 明细 1 秒缓存：概览页每秒刷新时复用，避免重复起进程
+_NV_CACHE = {"t": 0.0, "v": None}
+# TTL 略大于后台采样间隔（1s），避免刷新任务正好撞上缓存过期的瞬间而自己又读一次
+_NV_TTL = 1.8
+
+
+def _nvidia_smi_cached():
+    now = time.time()
+    if _NV_CACHE["v"] is not None and now - _NV_CACHE["t"] < _NV_TTL:
+        return _NV_CACHE["v"]
+    v = _nvidia_smi()
+    _NV_CACHE.update(t=now, v=v)
+    return v
+
+
 # --------------------------------------------------------------------------
 # 全显卡（多 GPU）：PDH「GPU Engine」计数器（所有厂商通用，任务管理器同款）
 # + HKLM\SOFTWARE\Microsoft\DirectX 的 AdapterLuid -> 显卡名 映射
@@ -1729,17 +1956,32 @@ def _gpu_luid_of(inst_name):
 
 # 只取 3D 引擎实例（任务管理器的 GPU 占用口径），避免几百个实例拖慢采样
 _GPU_ENGINE_TYPES = ("engtype_3D",)
-_gpu_conn = {"t": 0.0, "q": None, "luids": []}
+_gpu_conn = {"t": 0.0, "q": None, "luids": [], "lt": 0.0, "last": None}
 _GPU_CONN_TTL = 120.0
 _gpu_conn_lock = threading.Lock()
 
 
+# 按进程聚合的 GPU 占用（每次 GPU Engine 采样时同步更新，供进程列表使用）
+_GPU_BY_PID = {}
+
+
+def _gpu_pid_of(inst):
+    """从 GPU Engine 实例名取进程号：'pid_1234_luid_0x...' -> 1234。"""
+    m = re.search(r"pid_(\d+)", inst or "")
+    return int(m.group(1)) if m else None
+
+
 def _gpu_engine_utils():
-    """1s 采样：返回 {luid_int: 占用%}。刚建查询的首秒返回 {}（无基线）。"""
+    """1s 采样：返回 {luid_int: 占用%}，同时把 {pid: 占用%} 写入 _GPU_BY_PID。
+    刚建查询的首秒返回 {}（无基线）。
+    内部节流 ≥0.9s：调用方有常驻采样线程与 perf_stats 两处，过近的第二次采样
+    会因 PDH 速率计数器没有新基线得到全 0，覆盖掉 _GPU_BY_PID。"""
     if _pdh is None:
         return {}
     now = time.time()
     with _gpu_conn_lock:
+        if _gpu_conn["q"] is not None and now - _gpu_conn["lt"] < 0.9:
+            return _gpu_conn["last"] or {}
         if now - _gpu_conn["t"] > _GPU_CONN_TTL or _gpu_conn["q"] is None:
             if _gpu_conn["q"]:
                 _gpu_conn["q"].close()
@@ -1755,20 +1997,30 @@ def _gpu_engine_utils():
             else:
                 _gpu_conn.update(t=now, q=None, luids=[])
                 return {}
+            _gpu_conn.update(lt=now, last=None)
             return {}          # 首个样本只做基线
         vals = _gpu_conn["q"].collect_and_read()
+        _gpu_conn["lt"] = now
     agg = {}
+    by_pid = {}
     for p, v in vals.items():
         if v:
+            fv = float(v)
             lu = _gpu_luid_of(p)
             if lu is not None:
-                agg[lu] = min(100.0, agg.get(lu, 0.0) + float(v))
+                agg[lu] = min(100.0, agg.get(lu, 0.0) + fv)
+            pid = _gpu_pid_of(p)
+            if pid is not None:
+                by_pid[pid] = min(100.0, by_pid.get(pid, 0.0) + fv)
+    _gpu_conn["last"] = agg
+    _GPU_BY_PID.clear()
+    _GPU_BY_PID.update(by_pid)
     return agg
 
 
 def _gpu_base():
-    """8s：全显卡名单。{index, name, luid, temp, nv_util}（nv_util 是 NVIDIA 兜底占用）。"""
-    nv = _nvidia_smi()
+    """8s：全显卡名单。{index, name, luid, temp, nv_util}（nv_util/temp 是 NVIDIA 兜底值）。"""
+    nv = _nvidia_smi_cached()
     adapters = _dx_adapters()
     out = []
     for lu in _gpu_conn["luids"] or []:
@@ -2888,22 +3140,29 @@ _slow_lock = threading.Lock()
 _FAST_SCRIPT = (
     "$t=$null;"
     "try{$z=Get-CimInstance -Namespace root/wmi -ClassName MSAcpi_ThermalZoneTemperature"
-    " -ErrorAction SilentlyContinue|Sort-Object CurrentTemperature -Descending"
-    "|Select-Object -First 1;"
-    "if($z){$t=[math]::Round($z.CurrentTemperature/10.0-273.15,1)}}catch{};"
+    " -ErrorAction SilentlyContinue;"
+    "if($z){$a=($z|Measure-Object -Property CurrentTemperature -Average).Average;"
+    "$t=[math]::Round($a/10.0-273.15,1)}}catch{};"
     "if($null -eq $t){try{$z2=Get-CimInstance Win32_PerfFormattedData_Counters_ThermalZoneInformation"
-    " -ErrorAction SilentlyContinue|Sort-Object Temperature -Descending|Select-Object -First 1;"
-    "if($z2){$t=[math]::Round([double]$z2.Temperature-273.15,1)}}catch{}};"
+    " -ErrorAction SilentlyContinue;"
+    "if($z2){$b=($z2|Measure-Object -Property Temperature -Average).Average;"
+    "$t=[math]::Round([double]$b-273.15,1)}}catch{}};"
     "if($null -eq $t){$t='NA'};"
     "'CPUTEMP='+$t;"
 )
 
 _CPU_TEMP_CACHE = {"t": 0.0, "v": None, "ok": True}
-_CPU_TEMP_TTL = 8.0
+# TTL 略大于采样间隔：后台线程每秒预热，UI 每次读都能命中，刷新耗时接近 0
+_CPU_TEMP_TTL = 1.8
+_CPU_TEMP_HIST = []          # 最近几次读数，用于平滑 ACPI 热区的 ±3℃ 抖动
 
 
 def cpu_temp():
-    """CPU 温度。WMI/ACPI 读取要起 PowerShell，缓存 8 秒；读不到就不再重试太久。"""
+    """CPU 温度。WMI/ACPI 读取要起 PowerShell（约 0.5s），缓存 1.8 秒。
+
+    ACPI 热区读数本身在几十度范围内有 ±3℃ 的抖动（不同传感器交替成为最热区），
+    所以对最近 3 次取平均再返回，读数更稳；读不到返回 None。
+    """
     now = time.time()
     if now - _CPU_TEMP_CACHE["t"] < _CPU_TEMP_TTL:
         return _CPU_TEMP_CACHE["v"]
@@ -2919,16 +3178,20 @@ def cpu_temp():
                     v = None
     except Exception:
         v = None
+    if v is not None:
+        _CPU_TEMP_HIST.append(v)
+        del _CPU_TEMP_HIST[:-3]
+        v = round(sum(_CPU_TEMP_HIST) / len(_CPU_TEMP_HIST), 1)
     _CPU_TEMP_CACHE.update(t=now, v=v)
     return v
 
 
 _GPU_AGG_CACHE = {"t": 0.0, "v": None}
-_GPU_AGG_TTL = 2.0
+_GPU_AGG_TTL = 10.0          # 只是兜底值（有 PDH 时会被逐卡占用覆盖），拉长到 10s 省开销
 
 
 def _gpu_aggregate_cached():
-    """GPU 聚合占用。WMI 枚举较慢，缓存 2 秒。"""
+    """GPU 聚合占用（兜底）。WMI 枚举约 1 秒，缓存 10 秒。"""
     now = time.time()
     if now - _GPU_AGG_CACHE["t"] < _GPU_AGG_TTL:
         return _GPU_AGG_CACHE["v"]
@@ -2965,13 +3228,16 @@ def _wmi_perf_fallback():
 
 
 def _fast_fetch():
-    """1 秒级：CPU 温度（8s 缓存）+ GPU 聚合（2s 缓存）+ 磁盘实时活动（1s）。"""
+    """1 秒级：CPU 温度 + GPU 温度 + GPU 聚合占用 + 磁盘实时活动。
+    （全部在后台线程调用，PowerShell / nvidia-smi 的开销不会卡住界面）"""
     disks, agg = disk_activity()
     if disks is None:
         disks = _wmi_perf_fallback()
         agg = (sum((d["util"] or 0) for d in disks) / len(disks)) if disks else None
+    nv = _nvidia_smi_cached()
+    gpu_temp = next((g["temp"] for g in nv if g.get("temp") is not None), None)
     return {"cpu_temp": cpu_temp(), "disks": disks, "disk": agg,
-            "gpu": _gpu_aggregate_cached(), "gpu_temp": None,
+            "gpu": _gpu_aggregate_cached(), "gpu_temp": gpu_temp,
             "gpu_utils": _gpu_engine_utils(), "gpus": [],
             "realtime": True}
 
@@ -2983,13 +3249,56 @@ def _slow_fetch():
     return {"gpus": gpus, "gpu_temp": gpu_temp}
 
 
+# --------------------------------------------------------------------------
+# 温度后台采样：CPU 温度要走一次 PowerShell（约 0.5s），若放在刷新任务里会让
+# 每秒的刷新耗时超过 1 秒而排队。这里用常驻后台线程每秒预热缓存，
+# UI 读取时直接命中 → 温度照样 1 秒刷新，但刷新任务本身几乎零耗时。
+# --------------------------------------------------------------------------
+_sampler = {"thread": None, "last_read": 0.0}
+
+
+def _temp_loop():
+    while True:
+        try:
+            cpu_temp()
+        except Exception:
+            pass
+        try:
+            _nvidia_smi_cached()
+        except Exception:
+            pass
+        # GPU Engine 按 pid 聚合 → _GPU_BY_PID（CPU 调试页进程表的 GPU 占用数据源）。
+        # 必须常驻喂养：概览页不开时 perf_stats 不跑，进程表的 GPU 列会全空。
+        # 函数内部有 ≥0.9s 节流，与 perf_stats 撞车安全
+        try:
+            _gpu_engine_utils()
+        except Exception:
+            pass
+        # 最近没人读数据（窗口最小化 / 停留在别的页面）就降频，避免白耗 CPU
+        idle = (time.time() - _sampler["last_read"]) > 20
+        time.sleep(5.0 if idle else 1.0)
+
+
+def temp_sampler_start():
+    """惰性启动温度采样线程（只启一次，daemon 线程随进程退出）。"""
+    th = _sampler.get("thread")
+    if th is not None and th.is_alive():
+        return
+    import threading
+    th = threading.Thread(target=_temp_loop, name="wtb-temp-sampler", daemon=True)
+    th.start()
+    _sampler["thread"] = th
+
+
 def perf_stats():
     """CPU temp, GPU list, disk list. Values are None when unsupported.
 
     两层缓存，合并后结构与老版本完全一致（UI 无需改字段）：
-      - fast（1s）：CPU 温度 / GPU 聚合 / 磁盘实时活动 —— 负责「实时」；
+      - fast（1s）：CPU 温度 / GPU 温度 / GPU 聚合 / 磁盘实时活动 —— 负责「实时」；
       - slow（8s）：nvidia-smi 明细 —— 负责「完整」。
     """
+    temp_sampler_start()          # 温度由后台线程预热，这里读到的永远是 1 秒内的新值
+    _sampler["last_read"] = time.time()      # 有人在看 → 采样线程保持 1 秒频率
     now = time.time()
 
     fast = _fast_cache["data"]
@@ -3012,12 +3321,21 @@ def perf_stats():
 
     data = dict(fast)
     data.update(slow)
+    # GPU 温度用 1s 级的实时值（slow 里那份是 8s 的，只作兜底）
+    ft = fast.get("gpu_temp")
+    if ft is not None:
+        data["gpu_temp"] = ft
     # 每块 GPU 的实时占用：PDH GPU Engine（全厂商通用）优先，NVIDIA 无 PDH 时用 nvidia-smi 兜底
     utils = data.get("gpu_utils") or {}
     if data.get("gpus"):
         for g in data["gpus"]:
             live = utils.get(g["luid"]) if g.get("luid") is not None else None
             g["util"] = live if live is not None else g.get("nv_util")
+            # N 卡温度回填实时值，让 GPU 详情卡也每秒更新
+            if ft is not None:
+                nm = (g.get("name") or "").lower()
+                if g.get("nv_util") is not None or "nvidia" in nm or "geforce" in nm:
+                    g["temp"] = int(round(ft))
         vals = [g["util"] for g in data["gpus"] if g.get("util") is not None]
         if vals:
             data["gpu"] = max(0.0, min(100.0, sum(vals) / float(len(vals))))
