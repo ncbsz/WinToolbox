@@ -505,7 +505,7 @@ QLabel#MetricK {{
 }}
 QLabel#MetricV {{
     font-family: "Cascadia Mono", Consolas, "Microsoft YaHei UI", monospace;
-    font-size: {f(30)}; font-weight: 600; color: {P["TEXT"]};
+    font-size: {f(26)}; font-weight: 600; color: {P["TEXT"]};
     background: transparent;
 }}
 QLabel#MetricU {{
@@ -726,6 +726,12 @@ QLabel#NoticeErr  {{ border-radius: {s(R_NOTICE)}; padding: {s(12)} {s(15)}; fon
     background: {bg("ERR_BG")}; border: {s(1)} solid {bgl("ERR")}; color: {P["ERR"]}; }}
 QLabel#NoticeOk   {{ border-radius: {s(R_NOTICE)}; padding: {s(12)} {s(15)}; font-size: {f(12.5)};
     background: {bg("OK_BG")}; border: {s(1)} solid {bgl("OK")}; color: {P["OK"]}; }}
+
+/* 显卡伪装：横贯整卡的「当前名 → 新名」大号预览块 */
+QLabel#GpuPreview {{
+    border-radius: {s(R_CARD)}; padding: {s(16)} {s(18)}; font-size: {f(14)};
+    background: {bg("PANEL2")}; border: {s(1)} solid {bgl("LINE2")}; color: {P["TEXT"]};
+}}
 
 QStatusBar {{ background: {bg("PANEL")}; border-bottom-left-radius: {s(R_SHELL)}; border-bottom-right-radius: {s(R_SHELL)}; border-top: {s(1)} solid {bgl("LINE")}; color: {P["TEXT2"]}; }}
 QStatusBar[maximized="true"] {{ border-bottom-left-radius: 0px; border-bottom-right-radius: 0px; }}

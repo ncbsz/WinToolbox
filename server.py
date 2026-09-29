@@ -5,8 +5,8 @@ WinToolbox backend  —  pure stdlib, no pip installs required.
 
 Serves the Fluent (blue/white) web UI from ./web and exposes a JSON API that
 performs REAL Windows operations: registry tweaks, service control, process /
-memory management, network repair, uninstall listing, junk cleanup, policy
-diagnosis and an infected-PE (Synaptics/XRed) scanner.
+memory management, network repair, uninstall listing, junk cleanup and policy
+diagnosis.
 
 Run:  python server.py            (browser opens automatically)
 """
@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -51,7 +52,6 @@ if not os.path.isdir(WEB):
     os.makedirs(WEB, exist_ok=True)
 
 HOST, PORT = "127.0.0.1", 8760
-LOADER_CODE_MD5 = "33fbe30e8a64654287edd1bf05ae7c8c"   # Synaptics / XRed loader stub
 HIVE = {"HKLM": 0x80000002, "HKCU": 0x80000001, "HKCR": 0x80000000, "HKU": 0x80000003,
         "HKCC": 0x80000005}
 
@@ -65,8 +65,18 @@ def is_admin():
         return False
 
 
+# 子进程并发闸门：老机器上 PowerShell 起一次要 0.3~1.5s CPU，启动瞬间实测有 10 个
+# 并发（系统信息 + 性能采样 + 网卡枚举 + PDH 建连），双核机直接被顶满。这里限制同时
+# 最多 3 个，其余排队 —— 总工作量不变，但 CPU 峰值被削平。
+_CHILD_SEM = threading.Semaphore(3)
+
+
 def run(cmd, timeout=25, shell=False):
-    """Run a command, return (rc, stdout+stderr text)."""
+    """Run a command, return (rc, stdout+stderr text).
+
+    受 `_CHILD_SEM` 限流；排队超过 30 秒就直接跑（宁可超限也不要卡死调用方）。
+    """
+    _CHILD_SEM.acquire(timeout=30)
     try:
         p = subprocess.run(cmd, capture_output=True, timeout=timeout, shell=shell,
                            creationflags=0x08000000)   # CREATE_NO_WINDOW
@@ -81,6 +91,8 @@ def run(cmd, timeout=25, shell=False):
         return -1, "TIMEOUT"
     except Exception as e:
         return -1, str(e)
+    finally:
+        _CHILD_SEM.release()
 
 
 _PS_PREFIX = ("[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
@@ -219,6 +231,16 @@ class FILETIME(ctypes.Structure):
 
 _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
+# ---- 带缓存的重查询一律加锁（单飞）----
+# 这些函数都跑在后台线程里，而 UI 侧有 1 秒心跳 + 两个常驻采样线程会并发调用它们。
+# 没锁时会出现「缓存击穿」：两个线程同时看到缓存为空 → 同一条 PowerShell / nvidia-smi
+# 被同时发出去两份（实测启动瞬间 sys_basic 跑 2 遍、nvidia-smi 同一秒跑 2 遍）。
+_SYS_BASIC_LOCK = threading.Lock()
+_NV_LOCK = threading.Lock()
+_CPU_TEMP_LOCK = threading.Lock()
+_GPU_AGG_LOCK = threading.Lock()
+_NET_ADAPTERS_FAIL_TTL = 5.0     # 网卡信息查询失败后的退避时间
+
 
 def mem_status():
     m = MEMORYSTATUSEX()
@@ -323,29 +345,30 @@ def sys_basic():
 
     首次约 1.8s，之后进程内缓存直接返回（OS 版本 / CPU / 核数开机后不会变）。
     """
-    if _SYS_BASIC["v"] is not None:
-        return _SYS_BASIC["v"]
-    rc, out = ps("$o=Get-CimInstance Win32_OperatingSystem; "
-                 "$p=Get-CimInstance Win32_Processor | Select-Object -First 1; "
-                 "'{0}|||{1}|||{2}|||{3}|||{4}|||{5}' -f $o.Caption,$o.Version,$o.OSArchitecture,"
-                 "$p.Name,$p.NumberOfCores,$p.NumberOfLogicalProcessors")
-    f = out.strip().split("|||")
-    if len(f) < 6:
-        f = (f + [""] * 6)[:6]
-    try:
-        cores, logical = int(f[4]), int(f[5])
-    except Exception:
-        cores = logical = os.cpu_count() or 1
-    res = {"caption": f[0].strip(), "version": f[1].strip(), "arch": f[2].strip(),
-           "cpu": f[3].strip() or "Unknown CPU", "cores": cores, "logical": logical}
-    # CPU 标称基准频率（任务管理器「基准速度」同源：CallNtPowerInformation 的 MaxMhz；
-    # 注册表 ~MHz 在 Win11 上会跟随当前频率浮动，仅作兜底）
-    res["base_mhz"] = cpu_base_mhz()
-    # 功能更新代号（24H2 / 25H2…）+ 完整内部版本号（26200.9168）
-    rel, full = os_release()
-    res["release"], res["build_full"] = rel, full
-    _SYS_BASIC["v"] = res
-    return res
+    with _SYS_BASIC_LOCK:
+        if _SYS_BASIC["v"] is not None:
+            return _SYS_BASIC["v"]
+        rc, out = ps("$o=Get-CimInstance Win32_OperatingSystem; "
+                     "$p=Get-CimInstance Win32_Processor | Select-Object -First 1; "
+                     "'{0}|||{1}|||{2}|||{3}|||{4}|||{5}' -f $o.Caption,$o.Version,$o.OSArchitecture,"
+                     "$p.Name,$p.NumberOfCores,$p.NumberOfLogicalProcessors")
+        f = out.strip().split("|||")
+        if len(f) < 6:
+            f = (f + [""] * 6)[:6]
+        try:
+            cores, logical = int(f[4]), int(f[5])
+        except Exception:
+            cores = logical = os.cpu_count() or 1
+        res = {"caption": f[0].strip(), "version": f[1].strip(), "arch": f[2].strip(),
+               "cpu": f[3].strip() or "Unknown CPU", "cores": cores, "logical": logical}
+        # CPU 标称基准频率（任务管理器「基准速度」同源：CallNtPowerInformation 的 MaxMhz；
+        # 注册表 ~MHz 在 Win11 上会跟随当前频率浮动，仅作兜底）
+        res["base_mhz"] = cpu_base_mhz()
+        # 功能更新代号（24H2 / 25H2…）+ 完整内部版本号（26200.9168）
+        rel, full = os_release()
+        res["release"], res["build_full"] = rel, full
+        _SYS_BASIC["v"] = res
+        return res
 
 
 def disks():
@@ -362,8 +385,263 @@ def disks():
     return res
 
 
+# GetTickCount64 返回 ULONGLONG，ctypes 默认按「有符号 32 位」解析 ——
+# 连续开机超过 24.8 天就会变成负数，界面上的运行时长直接读不出来。
+_k32.GetTickCount64.restype = ctypes.c_ulonglong
+
+_UPTIME_CACHE = {"t": 0.0, "v": None}
+
+
 def uptime_seconds():
-    return int(_k32.GetTickCount64() / 1000)
+    """开机时长（秒）。
+
+    首选 GetTickCount64（已修正 restype）；异常或数值不合理时回退 WMI
+    （`(Get-Date) - LastBootUpTime`，结果缓存 60s，避免反复起进程）；都失败返回 None。
+    """
+    try:
+        v = int(_k32.GetTickCount64() / 1000)
+        if v > 0:
+            return v
+    except Exception:
+        pass
+    now = time.time()
+    if _UPTIME_CACHE["v"] is not None and now - _UPTIME_CACHE["t"] < 60:
+        return _UPTIME_CACHE["v"]
+    rc, out = ps("[int]((Get-Date) - "
+                 "(Get-CimInstance Win32_OperatingSystem).LastBootUpTime).TotalSeconds",
+                 timeout=25)
+    m = re.findall(r"-?\d+", out or "")
+    if rc == 0 and m:
+        v = int(m[-1])
+        if v > 0:
+            _UPTIME_CACHE["t"], _UPTIME_CACHE["v"] = now, v
+            return v
+    return None
+
+
+def boot_time():
+    """开机时刻（本地时间，如 2026-09-24 12:03）；取不到返回 ""。"""
+    u = uptime_seconds()
+    if not u:
+        return ""
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(time.time() - u))
+    except Exception:
+        return ""
+
+
+# --------------------------------------------------------------------------
+# 硬件标识：主板 / 显示器（EDID）/ 内存条 —— 都是一次查询 + 进程内缓存，
+# 不进 1 秒心跳；UI 侧只在「系统信息」刷新时取一次。
+# --------------------------------------------------------------------------
+_VENDOR_CN = [
+    ("asustek", "华硕"), ("asus", "华硕"), ("micro-star", "微星"), ("msi", "微星"),
+    ("gigabyte", "技嘉"), ("asrock", "华擎"), ("biostar", "映泰"), ("colorful", "七彩虹"),
+    ("maxsun", "铭瑄"), ("onda", "昂达"), ("soyo", "梅捷"), ("ecs ", "精英"),
+    ("foxconn", "富士康"), ("pegatron", "和硕"), ("compal", "仁宝"), ("quanta", "广达"),
+    ("clevo", "蓝天"), ("tongfang", "同方"), ("hasee", "神舟"), ("lenovo", "联想"),
+    ("hewlett", "惠普"), ("hp ", "惠普"), ("dell", "戴尔"), ("acer", "宏碁"),
+    ("samsung", "三星"), ("intel", "英特尔"), ("microsoft", "微软"), ("apple", "苹果"),
+    ("huawei", "华为"), ("supermicro", "超微"), ("razer", "雷蛇"), ("lg ", "LG"),
+    ("crucial", "英睿达"), ("micron", "镁光"), ("kingston", "金士顿"),
+    ("hynix", "海力士"), ("ramaxel", "记忆科技"), ("adata", "威刚"),
+    ("corsair", "海盗船"), ("g.skill", "芝奇"), ("teamgroup", "十铨"),
+    ("kimtigo", "金泰克"), ("gloway", "光威"), ("asgard", "阿斯加特"),
+    ("netac", "朗科"), ("a-data", "威刚"), ("transcend", "创见"), ("pny", "必恩威"),
+]
+# 长键优先，避免 "hp" 抢了 "hpe"、"asus" 抢了 "asustek"
+_VENDOR_KEYS = sorted(_VENDOR_CN, key=lambda kv: -len(kv[0]))
+
+
+def vendor_cn(name):
+    """常见厂商英文名 → 中文简称；没命中就原样返回，绝不猜。"""
+    low = (name or "").strip().lower()
+    if not low:
+        return ""
+    for key, cn in _VENDOR_KEYS:
+        if low.startswith(key.strip()):
+            return cn
+    return (name or "").strip()
+
+
+_BASEBOARD = {"v": None}
+
+
+def baseboard():
+    r"""主板厂商 + 型号。
+
+    优先注册表 `HKLM\HARDWARE\DESCRIPTION\System\BIOS`（0 开销），
+    读不到再回退 WMI Win32_BaseBoard（一次查询并缓存）。
+    """
+    if _BASEBOARD["v"] is not None:
+        return _BASEBOARD["v"]
+    man = prod = ""
+    if winreg is not None:
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                r"HARDWARE\DESCRIPTION\System\BIOS", 0,
+                                winreg.KEY_READ) as k:
+                def _gv(nm):
+                    try:
+                        return str(winreg.QueryValueEx(k, nm)[0]).strip()
+                    except OSError:
+                        return ""
+                man, prod = _gv("BaseBoardManufacturer"), _gv("BaseBoardProduct")
+                if not prod:                      # 部分 OEM 只填 System* 组
+                    man = man or _gv("SystemManufacturer")
+                    prod = _gv("SystemProductName")
+        except OSError:
+            pass
+    if not prod:
+        rc, out = ps("(Get-CimInstance Win32_BaseBoard).Manufacturer + '|||' + "
+                     "(Get-CimInstance Win32_BaseBoard).Product", timeout=30)
+        f = ((out or "").strip().split("|||") + ["", ""])[:2]
+        man = man or f[0].strip()
+        prod = prod or f[1].strip()
+    label = ("%s %s" % (vendor_cn(man), prod)).strip() if man else prod.strip()
+    res = {"manufacturer": man.strip(), "product": prod.strip(), "label": label}
+    _BASEBOARD["v"] = res
+    return res
+
+
+# EDID 里的三位厂商码 → 面板/整机厂中文名
+_EDID_VENDOR = {
+    "AUO": "友达", "LGD": "LG Display", "LPL": "LG Display", "LTM": "LG Display",
+    "BOE": "京东方", "SEC": "三星", "SDC": "三星", "SAM": "三星",
+    "CSO": "华星光电", "CMN": "奇美", "CMO": "奇美", "CPT": "中华映管",
+    "IVM": "冠捷", "AOC": "冠捷", "DEL": "戴尔", "ACI": "华硕", "AUS": "华硕",
+    "HWP": "惠普", "LEN": "联想", "VSC": "优派", "MSI": "微星", "BNQ": "明基",
+    "ACR": "宏碁", "PHL": "飞利浦", "SNY": "索尼", "NEC": "NEC", "PAN": "松下",
+    "SHP": "夏普", "HEC": "现代", "HIT": "日立", "TOS": "东芝", "TCL": "TCL",
+    "INL": "群创", "HKC": "惠科", "SKG": "天马",
+}
+
+_MONITORS = {"v": None}
+
+
+def _edid_parse(b):
+    """解析 128 字节 EDID 头：型号名 / 厂商码 / 商品码 / 对角尺寸。"""
+    if len(b) < 128 or bytes(b[0:8]) != b"\x00\xff\xff\xff\xff\xff\xff\x00":
+        return None
+    v = (b[8] << 8) | b[9]
+    pnp = "".join(chr(((v >> sh) & 0x1F) + 64) for sh in (10, 5, 0))
+    pnp = "".join(ch for ch in pnp if ch.isalpha())
+    code = "%04X" % ((b[11] << 8) | b[10])          # 商品码（小端）
+    w_cm, h_cm = b[21], b[22]
+    try:
+        inch = round(((w_cm ** 2 + h_cm ** 2) ** 0.5) / 2.54, 1) if (w_cm and h_cm) else None
+    except Exception:
+        inch = None
+    name = ""
+    for off in (54, 72, 90, 108):                   # 四个描述符块找 0xFC = 名称
+        blk = bytes(b[off:off + 18])
+        if len(blk) == 18 and blk[0:3] == b"\x00\x00\x00" and blk[3] == 0xFC:
+            name = blk[5:18].decode("ascii", "ignore").replace("\x00", " ").strip()
+            if name:
+                break
+    return {"name": name, "pnp": (pnp + code) if pnp else code,
+            "vendor": _EDID_VENDOR.get(pnp, pnp), "inch": inch}
+
+
+_FAKE_MON_NAMES = ("hdmi", "display", "generic", "default", "vga", "dvi", "dp")
+
+
+def _monitor_score(m):
+    """给一块屏打分，用来把虚拟显示器的伪 EDID 排到后面。"""
+    score = 0
+    name = (m.get("name") or "").strip()
+    low = name.lower()
+    if name and not any(low.startswith(x) for x in _FAKE_MON_NAMES) and len(name) >= 4:
+        score += 1                              # 型号名像真的（B156HAN15.H / DELL U2419H）
+    if m.get("pnp", "")[:3] in _EDID_VENDOR:
+        score += 1                              # 厂商码可识别
+    inch = m.get("inch") or 0
+    if 8 <= inch <= 34:
+        score += 1                              # 笔记本内置屏 / 常见桌面显示器
+    return score
+
+
+def monitors():
+    """显示器：解析注册表里每块屏的 EDID（毫秒级，且不依赖虚拟显示器配合）。
+
+    虚拟显示器一般没有 EDID，自然被过滤掉；结果按屏幕尺寸从大到小排序。
+    """
+    if _MONITORS["v"] is not None:
+        return _MONITORS["v"]
+    out, seen = [], set()
+    root = r"SYSTEM\CurrentControlSet\Enum\DISPLAY"
+    if winreg is not None:
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, root, 0,
+                                winreg.KEY_READ) as rk:
+                subs = [winreg.EnumKey(rk, i) for i in range(winreg.QueryInfoKey(rk)[0])]
+        except OSError:
+            subs = []
+        for sub in subs:
+            try:
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, root + "\\" + sub, 0,
+                                    winreg.KEY_READ) as sk:
+                    insts = [winreg.EnumKey(sk, i)
+                             for i in range(winreg.QueryInfoKey(sk)[0])]
+            except OSError:
+                continue
+            for inst in insts:
+                try:
+                    with winreg.OpenKey(
+                            winreg.HKEY_LOCAL_MACHINE,
+                            root + "\\" + sub + "\\" + inst + "\\Device Parameters",
+                            0, winreg.KEY_READ) as dp:
+                        raw = winreg.QueryValueEx(dp, "EDID")[0]
+                except OSError:
+                    continue
+                info = _edid_parse(bytes(raw))
+                if not info:
+                    continue
+                key = (info["pnp"], info["name"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                info["_score"] = _monitor_score(info)
+                out.append(info)
+
+    # 排序：先"像真屏"的（型号名正常 / 厂商可识别 / 尺寸在面板常见区间），
+    # 再按尺寸从大到小 —— 虚拟显示器驱动常伪造 EDID（型号写成 HDMI2.0、尺寸离谱），
+    # 这样真正的内置屏 / 外接屏会排在前面，虚拟屏退到提示里。
+    out.sort(key=lambda x: (-x.pop("_score", 0), -(x["inch"] or 0)))
+    _MONITORS["v"] = out
+    return out
+
+
+_MEM_MODULES = {"v": None}
+_MEM_TYPES = {20: "DDR", 21: "DDR2", 24: "DDR3", 26: "DDR4", 27: "LPDDR",
+              28: "LPDDR2", 29: "LPDDR3", 30: "LPDDR4", 34: "DDR5", 35: "LPDDR5"}
+
+
+def memory_modules():
+    """内存条明细：厂商 / 容量字节 / 频率 / 颗粒类型（一次 WMI 查询并缓存）。"""
+    if _MEM_MODULES["v"] is not None:
+        return _MEM_MODULES["v"]
+    # 用 -join 拼字段，避免在 PowerShell 里再套一层带引号的格式串（引号转义最容易翻车）
+    rc, out = ps("Get-CimInstance Win32_PhysicalMemory | ForEach-Object { "
+                 "@($_.Manufacturer,$_.Capacity,$_.Speed,$_.ConfiguredClockSpeed,"
+                 "$_.PartNumber,$_.SMBIOSMemoryType) -join '|||' }", timeout=30)
+    res = []
+    for line in (out or "").splitlines():
+        f = [x.strip().strip('"') for x in line.split("|||")]
+        if len(f) < 6:
+            continue
+
+        def _num(x):
+            try:
+                return int(float(x or 0))
+            except ValueError:
+                return 0
+
+        res.append({"manufacturer": f[0], "capacity": _num(f[1]),
+                    "speed": _num(f[3]) or _num(f[2]), "part": f[4],
+                    "type": _MEM_TYPES.get(_num(f[5]), "")})
+    _MEM_MODULES["v"] = res
+    return res
 
 
 # --------------------------------------------------------------------------
@@ -558,7 +836,23 @@ def _app_kind(name, publisher, sys_comp, parent=""):
     return "user"
 
 
-def list_software():
+_SOFTWARE_CACHE = {"data": None}
+
+# 更新补丁（Windows Updates 视图）的识别：KB 编号 / "Update for ..." / 安全更新
+_KB_RE = re.compile(r"(KB\d{5,7}|\bUpdate for\b|Security Update|Hotfix|"
+                    r"更新程序|更新包|安全更新)", re.I)
+
+
+def list_software(force=False):
+    """枚举已安装程序（带内存缓存：二次调用秒返回；force=True 强制重读）。
+
+    字段比 Geek Uninstaller 需要的更全：除名称/版本/发布者/大小/日期外，还包括
+    `uninstall`/`quiet`（卸载命令）、`location`（安装目录）、`icon`（图标）、
+    `modify`（修改/修复命令）、`url`（官网）、`bit`（32/64 位）、`kb`（是否系统更新补丁）。
+    缓存让「切换分类 / 排序 / 重新搜索」不再反复读注册表（Geek 用 XML 缓存达到同样效果）。
+    """
+    if not force and _SOFTWARE_CACHE["data"] is not None:
+        return _SOFTWARE_CACHE["data"]
     out = []
     if winreg is None:
         return out
@@ -592,6 +886,14 @@ def list_software():
                                 "quiet": q("QuietUninstallString"),
                                 "location": q("InstallLocation"),
                                 "icon": q("DisplayIcon"),
+                                "modify": q("ModifyPath") or q("ModifyString"),
+                                "url": (q("URLInfoAbout") or q("URLUpdateInfo")
+                                        or q("HelpLink") or ""),
+                                # 32/64 位：Wow6432Node 视图 = 32 位；HKLM 主视图 = 64 位；
+                                # HKCU 的 ARP 项来源不确定，留空不标
+                                "bit": ("32" if "WOW6432Node" in sub
+                                        else ("64" if hive == "HKLM" else "")),
+                                "kb": bool(_KB_RE.search(dn)),
                                 "kind": _app_kind(dn, pub, q("SystemComponent", 0),
                                                   q("ParentKeyName")),
                             })
@@ -608,7 +910,161 @@ def list_software():
         seen.add(sig)
         uniq.append(it)
     uniq.sort(key=lambda x: x["name"].lower())
+    _SOFTWARE_CACHE["data"] = uniq          # 缓存：分类/排序/搜索不再重读注册表
     return uniq
+
+
+# --------------------------------------------------------------------------
+# 软件条目右键动作（对齐 Geek Uninstaller 的右键菜单）
+#
+# 这些动作会**真的操作系统**（打开资源管理器 / 浏览器 / 注册表、删注册表键），
+# 因此统一写成可打桩的普通函数；设环境变量 WTB_NO_BROWSER=1 可让它们在测试中
+# 只返回成功、不弹任何窗口。
+# --------------------------------------------------------------------------
+_HIVE_ROOTS = {
+    "HKLM": "HKEY_LOCAL_MACHINE",
+    "HKCU": "HKEY_CURRENT_USER",
+    "HKCR": "HKEY_CLASSES_ROOT",
+    "HKU": "HKEY_USERS",
+}
+
+
+def _no_gui():
+    return bool(os.environ.get("WTB_NO_BROWSER"))
+
+
+def open_dir(path):
+    """在资源管理器里打开目录（给的是文件则打开其所在目录）。返回 True/False。"""
+    p = os.path.expandvars((path or "").strip().strip('"'))
+    if not p:
+        return False
+    target = p if os.path.isdir(p) else os.path.dirname(p)
+    if not (target and os.path.isdir(target)):
+        return False
+    try:
+        if not _no_gui():
+            os.startfile(target)                    # noqa: S606  Windows 专有
+        return True
+    except Exception:
+        return False
+
+
+def open_url(url):
+    """用默认浏览器打开链接（也支持 ms-windows-store: 之类的自定义协议）。"""
+    u = (url or "").strip()
+    if not u:
+        return False
+    if not re.match(r"^[a-z][a-z0-9+.\-]*:", u, re.I):     # 无协议头 → 补 https
+        u = "https://" + u
+    try:
+        if not _no_gui():
+            webbrowser.open(u)
+        return True
+    except Exception:
+        return False
+
+
+def google_search(text):
+    from urllib.parse import quote
+    return open_url("https://www.google.com/search?q=" + quote(text or ""))
+
+
+def open_store(name):
+    """在 Microsoft Store 里搜索该程序（Geek 的「在商店中打开」）。"""
+    from urllib.parse import quote
+    return open_url("ms-windows-store://search/?query=" + quote(name or ""))
+
+
+def _user_reg_root_label():
+    """regedit 的 LastKey 前缀：简体中文系统是「计算机」，其它是「Computer」。"""
+    try:
+        import ctypes
+        lang = ctypes.windll.kernel32.GetUserDefaultUILanguage()
+        if (lang & 0x3ff) == 0x04:                  # 0x0804 = 简体中文
+            return "计算机"
+    except Exception:
+        pass
+    return "Computer"
+
+
+def open_regedit(key_path):
+    """打开注册表编辑器并定位到指定键。
+
+    regedit 官方支持的定位方式：把完整键路径写进
+    `HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Applets\\Regedit\\LastKey`，
+    再以 `regedit -m`（打开上次位置）启动。
+    """
+    if winreg is None or not key_path:
+        return False
+    hive_s, _, rest = key_path.partition("\\")
+    root_name = _HIVE_ROOTS.get(hive_s)
+    if not rest or not root_name:
+        return False
+    if _no_gui():                       # 测试模式：不写注册表、不启动 regedit
+        return True
+    full = "%s\\%s\\%s" % (_user_reg_root_label(), root_name, rest)
+    try:
+        with winreg.CreateKeyEx(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Applets\Regedit",
+                0, winreg.KEY_WRITE) as k:
+            winreg.SetValueEx(k, "LastKey", 0, winreg.REG_SZ, full)
+    except OSError:
+        pass
+    try:
+        subprocess.Popen(["regedit.exe", "-m"])
+        return True
+    except Exception:
+        return False
+
+
+def run_detached(cmd):
+    """启动程序但不等待（用于「修改 / 修复安装」）。返回 (ok, msg)。"""
+    exe, args = parse_uninstall_cmd(cmd or "")
+    if not exe:
+        return False, "该程序没有提供「修改 / 修复」命令。"
+    if not os.path.exists(exe):
+        return False, "找不到程序：%s" % exe
+    try:
+        if not _no_gui():
+            subprocess.Popen('"%s" %s' % (exe, args))
+        return True, "已启动：%s" % os.path.basename(exe)
+    except Exception as e:
+        return False, "启动失败：%s" % e
+
+
+def _reg_delete_tree(hive_root, sub):
+    """递归删除注册表键（含所有子键与值）—— 等价于 Win32 `RegDeleteTree`。"""
+    try:
+        import ctypes
+        adv = ctypes.windll.advapi32
+        return adv.RegDeleteTreeW(ctypes.c_void_p(int(hive_root)),
+                                  ctypes.c_wchar_p(sub)) == 0
+    except Exception:
+        return False
+
+
+def force_remove_entry(key_path):
+    """强制移除程序的 Uninstall 条目（Geek 的「强制移除条目」）。
+
+    只删注册表条目、**不动程序文件** —— 用于卸载程序已损坏、无法正常卸载的情形。
+    返回 {ok, msg}。带安全阀：仅允许删 Uninstall 列表下的键。
+    """
+    if winreg is None:
+        return {"ok": False, "msg": "当前环境无法访问注册表。"}
+    hive_s, _, rest = (key_path or "").partition("\\")
+    if not rest:
+        return {"ok": False, "msg": "无效的注册表路径。"}
+    if "\\uninstall\\" not in (rest.lower() + "\\"):
+        return {"ok": False, "msg": "出于安全考虑，只能移除 Uninstall 列表下的条目。"}
+    root = {"HKLM": winreg.HKEY_LOCAL_MACHINE,
+            "HKCU": winreg.HKEY_CURRENT_USER}.get(hive_s)
+    if root is None:
+        return {"ok": False, "msg": "不支持的注册表根：%s" % hive_s}
+    if _reg_delete_tree(root, rest):
+        _SOFTWARE_CACHE["data"] = None              # 列表已变，下次 refresh 重读
+        return {"ok": True, "msg": "已移除条目：%s" % key_path}
+    return {"ok": False, "msg": "删除失败（可能需要管理员权限，或该条目已被移除）。"}
 
 
 STARTUP_LOCATIONS = [
@@ -620,83 +1076,781 @@ STARTUP_LOCATIONS = [
 ]
 
 
-def residual_scan(name, publisher="", location="", cap=40):
-    """卸载后的残留扫描：只定位、不删除。返回 {"files": [...], "reg": [...]}。
+# --------------------------------------------------------------------------
+# 软件卸载执行（参照 HiBit Uninstaller / Geek Uninstaller 的行为）
+#
+# 旧实现把整条 UninstallString 丢给 `cmd /c start ""`：无引号且含空格的路径
+# 会被空格截断（C:\Program Files\Foo\unins000.exe 直接打不开）；而且命令一发出
+# 就立刻返回 —— 卸载还没跑完就弹残留扫描，自然什么都扫不到。
+# 现在：解析命令行 → CreateProcess 直接启动（exe 统一加引号）→ 等卸载真正结束
+# （顶层进程退出 + 该程序的 Uninstall 注册表键消失，双判据）。
+# --------------------------------------------------------------------------
+_MSI_GUID_RE = re.compile(r"\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
+                          r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}")
 
-    files: 在常见安装/数据目录里找名称相关的目录与文件（含大小）；
-    reg:   HKLM/HKCU 的 SOFTWARE（含 WOW6432Node）第一层子键中名称相关的项。
-    """
-    tokens = set()
-    for src in (name or "", publisher or ""):
-        s = re.sub(r"[^\w\u4e00-\u9fff]+", " ", src or "").strip().lower()
-        if s:
-            tokens.add(s)
-            for w in s.split():
-                if len(w) >= 3 and w not in ("inc", "ltd", "llc", "software", "the"):
-                    tokens.add(w)
-    loc = (location or "").strip()
-    if loc and os.path.isdir(loc):
-        tokens.add(os.path.basename(loc.rstrip("\\/")).lower())
 
-    files, seen = [], set()
-    roots = [os.environ.get(k, "") for k in
-             ("ProgramFiles", "ProgramFiles(x86)", "ProgramData",
-              "LOCALAPPDATA", "APPDATA")]
-    for base in roots:
-        if not base or not os.path.isdir(base):
-            continue
+def parse_uninstall_cmd(cmd):
+    """解析 UninstallString → (exe, args_str)：展开环境变量、剥离外层引号，
+    无引号时按 `.exe/.com/.bat/.cmd` 边界切分（路径本身可能含空格）。"""
+    s = os.path.expandvars((cmd or "").strip())
+    if not s:
+        return "", ""
+    if s.startswith('"'):
+        end = s.find('"', 1)
+        if end > 0:
+            return s[1:end], s[end + 1:].strip()
+        return s[1:].strip(), ""
+    m = re.search(r"\.(?:exe|com|bat|cmd)(?=\s|$)", s, re.I)
+    if m:
+        return s[:m.end()], s[m.end():].strip()
+    return s, ""
+
+
+def _msi_guid(cmd):
+    m = _MSI_GUID_RE.search(cmd or "")
+    return m.group(0).upper() if m else ""
+
+
+def _arp_key_exists(key_path):
+    """该程序的 Uninstall 注册表键是否还在（64/32 位视图都试）。"""
+    if not key_path or winreg is None:
+        return True                       # 判断不了 → 当作还在，不误报"已完成"
+    hive_s, _, rest = (key_path or "").partition("\\")
+    root = {"HKLM": winreg.HKEY_LOCAL_MACHINE, "HKCU": winreg.HKEY_CURRENT_USER,
+            "HKCR": winreg.HKEY_CLASSES_ROOT, "HKU": winreg.HKEY_USERS}.get(hive_s)
+    if root is None or not rest:
+        return True
+    for flag in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
         try:
-            entries = os.listdir(base)
+            with winreg.OpenKey(root, rest, 0, winreg.KEY_READ | flag):
+                return True
         except OSError:
             continue
-        for entry in entries:
-            el = entry.lower()
-            if not any(t == el or t in el for t in tokens):
-                continue
-            full = os.path.join(base, entry)
-            if full.lower() in seen:
-                continue
-            seen.add(full.lower())
-            try:
-                sz = dir_size(full, cap=5000)[0] if os.path.isdir(full) \
-                    else os.path.getsize(full)
-            except OSError:
-                sz = 0
-            files.append({"path": full, "kind": "dir" if os.path.isdir(full) else "file",
-                          "bytes": sz})
-            if len(files) >= cap:
-                break
-        if len(files) >= cap:
-            break
+    return False
 
-    regs = []
-    if winreg is not None and tokens:
-        targets = [(winreg.HKEY_LOCAL_MACHINE, "HKLM", r"SOFTWARE"),
-                   (winreg.HKEY_LOCAL_MACHINE, "HKLM", r"SOFTWARE\WOW6432Node"),
-                   (winreg.HKEY_CURRENT_USER, "HKCU", r"SOFTWARE")]
-        for root, hive, sub in targets:
+
+def uninstall_software(key_path, cmd, timeout=1800):
+    """执行卸载并**等它真正结束**（后台线程调用，可能运行几十分钟）。
+
+    - MSI（含 {GUID}）：直接用 `msiexec /x {GUID} /qb /norestart`，不照搬原串；
+    - 普通 exe：解析出 exe 与参数，exe 加引号后交 CreateProcess（不走 cmd，避免
+      空格/引号解析坑）；卸载程序文件不存在时直接报"疑似残留注册表项"。
+    完成判据：顶层进程退出 **且** Uninstall 注册表键消失。
+    """
+    cmd = (cmd or "").strip()
+    if not cmd:
+        return {"ok": False, "msg": "该程序没有卸载命令"}
+    guid = _msi_guid(cmd)
+    exe = ""
+    if guid and re.search(r"msiexec", cmd, re.I):
+        exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                           "System32", "msiexec.exe")
+        line = '"%s" /x %s /qb /norestart' % (exe, guid)
+    else:
+        exe, args = parse_uninstall_cmd(cmd)
+        if not exe:
+            return {"ok": False, "msg": "无法解析卸载命令"}
+        if exe.lower().endswith((".bat", ".cmd")):
+            line = '"%s" %s' % (os.environ.get("ComSpec", "cmd.exe"),
+                                subprocess.list2cmdline([exe] + (args.split() if args else [])))
+        else:
+            probe = exe if os.path.isabs(exe) else (shutil.which(exe) or exe)
+            if os.path.isabs(probe) and not os.path.exists(probe):
+                return {"ok": False, "exe": exe, "left": True,
+                        "msg": "卸载程序文件不存在：%s\n该注册表项可能是卸载残留，"
+                               "可直接用「残留扫描」清理。" % exe}
+            line = '"%s" %s' % (probe, args)
+    try:
+        proc = subprocess.Popen(line, shell=False)
+    except Exception as e:
+        return {"ok": False, "exe": exe, "msg": "启动卸载程序失败：%s" % str(e)[:160]}
+    t0 = time.time()
+    deadline = t0 + max(60, int(timeout))
+    exited_at = None
+    while time.time() < deadline:
+        if exited_at is None:
             try:
-                k = winreg.OpenKey(root, sub, 0, winreg.KEY_READ)
-            except OSError:
+                proc.wait(timeout=2)
+                exited_at = time.time()
+            except subprocess.TimeoutExpired:
+                pass
+        gone = not _arp_key_exists(key_path)
+        if gone:
+            break
+        # 进程已退出但键还在：用户可能取消了卸载；给 20 秒宽限再收工
+        if exited_at is not None and time.time() - exited_at > 20:
+            break
+        time.sleep(1.5)
+    left = _arp_key_exists(key_path)
+    return {"ok": not left, "exe": exe, "left": left,
+            "secs": int(time.time() - t0),
+            "msg": "" if not left else
+                   "卸载程序已结束，但程序仍在「已安装」列表中（可能被取消、"
+                   "或需要重启后完成）。"}
+
+
+# ---- 残留扫描（参照 HiBit Uninstaller / Geek Uninstaller 的检查位置）----
+# 旧实现只扫 5 个根目录的**第一层**，漏掉最常见的第二层：
+#   %LOCALAPPDATA%\Programs\<名>（VSCode / Electron 类全在这）、
+#   C:\Program Files\<厂商>\<名>、%APPDATA%\<厂商>\<名>；
+# 注册表同样只扫第一层，漏掉 HKCU\SOFTWARE\<厂商>\<产品>、Uninstall 残留键、启动项与服务。
+_STOP_WORDS = {"inc", "ltd", "llc", "corp", "co", "gmbh", "limited", "company",
+               "software", "technologies", "technology", "studio", "team", "the",
+               "app", "desktop", "client", "setup", "update", "official", "tool",
+               # 品类通用词：命中它们会把无关程序也扫进来（如 downloader 命中
+               # Xbox Accessories、video 命中 MPC-BE），一律不作为匹配 token
+               "video", "downloader", "download", "player", "manager", "editor",
+               "viewer", "converter", "browser", "music", "photo", "code", "drive",
+               "notes", "note", "reader", "writer", "mail", "chat", "suite", "office",
+               "tools", "utility", "utilities", "system", "service", "driver",
+               "runtime", "library", "home", "pro", "plus", "lite", "free", "portable",
+               "media", "audio", "image", "graphics", "design", "master", "cleaner",
+               "assistant", "center", "panel", "control", "windows", "microsoft",
+               "premium", "edition", "ultimate", "professional", "standard", "basic"}
+_SKIP_ENTRIES = {"microsoft", "windows", "windowsapps", "common files", "internet explorer",
+                 "windows nt", "windows defender", "windows mail", "windows media player",
+                 "windows portable devices", "windows security", "temp", "temporary",
+                 "packages", "crashdumps", "d3dscache", "connecteddevicesplatform",
+                 "nvidia", "nvidia corporation", "intel", "amd", "realtek", "google",
+                 "mozilla", "apple", "adobe", "public", "default", "all users",
+                 "system volume information", "$recycle.bin", "classes", "policies",
+                 "clients", "wow6432node", "microsoft corporation"}
+
+
+def _res_tokens(name, publisher, extra=()):
+    """匹配 token：规范化全名（**先剥掉版本号/位数**，否则 "7-Zip 24.09 (x64)"
+    会变成 "7zip2409x64" 而匹配不上 "7-Zip"）+ 去停用词后的独立词（≥5 字符）。"""
+    full, words = set(), set()
+    for src in [name or "", publisher or ""] + list(extra or ()):
+        s = re.sub(r"[^\w\u4e00-\u9fff]+", " ", src or "").strip().lower()
+        if not s:
+            continue
+        full.add(s.replace(" ", ""))
+        # 只剥"多位数/点位版本号"与位数标记；单个数字保留（"7-Zip" 的 7 是名字一部分）
+        s2 = re.sub(r"\b(?:v?\d{2,}(?:[.\d]+)?|x64|x86|amd64|i386|bit|beta|alpha|rc|final|edition)\b",
+                    " ", s, flags=re.I)
+        s2 = re.sub(r"\s+", " ", s2).strip()
+        if s2:
+            full.add(s2.replace(" ", ""))
+            parts = s2.split()
+            # 前两词拼接与首词：补齐 "7-Zip → 7zip"、"WinRAR 7 → winrar" 这类
+            if len(parts) >= 2:
+                full.add(parts[0] + parts[1])
+            if len(parts[0]) >= 5 and parts[0] not in _STOP_WORDS:
+                full.add(parts[0])
+            for w in parts:
+                if len(w) >= 5 and w not in _STOP_WORDS:
+                    words.add(w)
+    return full, (words - full)
+
+
+def _lev_close(a, b, cap=2):
+    """编辑距离是否 ≤ cap（快速带长度/首字符预筛）。Geek 用同款思路容错
+    目录名与程序名的拼写差异；首字符必须一致 —— 否则 "video" 会误配 "4kvideo"。"""
+    if a == b:
+        return True
+    if abs(len(a) - len(b)) > cap or min(len(a), len(b)) < 5:
+        return False
+    if not a or not b or a[0] != b[0]:
+        return False
+    la, lb = len(a), len(b)
+    prev = list(range(lb + 1))
+    for i in range(1, la + 1):
+        cur = [i] + [0] * lb
+        best = cur[0]
+        ca = a[i - 1]
+        for j in range(1, lb + 1):
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1,
+                         prev[j - 1] + (0 if ca == b[j - 1] else 1))
+            if cur[j] < best:
+                best = cur[j]
+        if best > cap:
+            return False
+        prev = cur
+    return prev[lb] <= cap
+
+
+def _res_score(entry, full, words, fuzzy=True):
+    """命中强度：2 = 全名精确/近似匹配（可靠）；1 = 仅独立词匹配（可能与同名
+    品类混淆，低置信 → UI 默认不勾选）；0 = 未命中。"""
+    el = re.sub(r"[^\w\u4e00-\u9fff]+", " ", (entry or "")).strip().lower()
+    if not el:
+        return 0
+    eln = el.replace(" ", "")
+    if eln in full:
+        return 2
+    if fuzzy:
+        for f in full:
+            if len(f) >= 6 and _lev_close(eln, f, 2):
+                return 2
+    if set(el.split()) & words:
+        return 1
+    return 0
+
+
+def _res_hit(entry, full, words, fuzzy=True):
+    """是否命中（含低置信）。"""
+    return _res_score(entry, full, words, fuzzy) > 0
+
+
+def _walk2(base, depth=2):
+    """产出 base 下最多 depth 层的条目 (path, level)，跳过系统目录。"""
+    stack = [(base, 0)]
+    while stack:
+        cur, lv = stack.pop()
+        try:
+            names = os.listdir(cur)
+        except OSError:
+            continue
+        for nm in names:
+            if nm.lower() in _SKIP_ENTRIES:
                 continue
-            try:
-                n = winreg.QueryInfoKey(k)[0]
-                for i in range(n):
+            fullp = os.path.join(cur, nm)
+            yield fullp, lv + 1
+            if lv + 1 < depth and os.path.isdir(fullp) and not os.path.islink(fullp):
+                stack.append((fullp, lv + 1))
+
+
+def _scan_reg_products(full, words, cap):
+    """HKLM / HKCU 的 SOFTWARE（含 WOW6432Node）两层内的厂商/产品键。"""
+    out = []
+    targets = [(winreg.HKEY_LOCAL_MACHINE, "HKLM", r"SOFTWARE"),
+               (winreg.HKEY_LOCAL_MACHINE, "HKLM", r"SOFTWARE\WOW6432Node"),
+               (winreg.HKEY_CURRENT_USER, "HKCU", r"SOFTWARE")]
+    for root, hive, sub in targets:
+        try:
+            k = winreg.OpenKey(root, sub, 0, winreg.KEY_READ)
+        except OSError:
+            continue
+        try:
+            for i in range(winreg.QueryInfoKey(k)[0]):
+                try:
+                    lv1 = winreg.EnumKey(k, i)
+                except OSError:
+                    continue
+                if lv1.lower() in _SKIP_ENTRIES:
+                    continue
+                p1 = sub + "\\" + lv1
+                if _res_hit(lv1, full, words):
+                    out.append({"hive": hive, "path": p1, "tag": "厂商键"})
+                    if len(out) >= cap:
+                        return out
+                    continue                  # 命中一层就不再下探
+                try:
+                    with winreg.OpenKey(k, lv1) as sk:
+                        for j in range(winreg.QueryInfoKey(sk)[0]):
+                            try:
+                                lv2 = winreg.EnumKey(sk, j)
+                            except OSError:
+                                continue
+                            if _res_hit(lv2, full, words):
+                                out.append({"hive": hive, "path": p1 + "\\" + lv2,
+                                            "tag": "产品键"})
+                                if len(out) >= cap:
+                                    return out
+                except OSError:
+                    continue
+        finally:
+            winreg.CloseKey(k)
+    return out
+
+
+def _scan_reg_arp(full, words, cap):
+    """四处「已安装程序」列表里的残留项（按 DisplayName 匹配）。"""
+    out = []
+    for hive, sub, flag in UNINSTALL_ROOTS:
+        root = winreg.HKEY_LOCAL_MACHINE if hive == "HKLM" else winreg.HKEY_CURRENT_USER
+        try:
+            with winreg.OpenKey(root, sub, 0, winreg.KEY_READ | flag) as k:
+                for i in range(winreg.QueryInfoKey(k)[0]):
                     try:
-                        sk_name = winreg.EnumKey(k, i)
+                        key = winreg.EnumKey(k, i)
+                        with winreg.OpenKey(k, key) as sk:
+                            try:
+                                dn = str(winreg.QueryValueEx(sk, "DisplayName")[0])
+                            except OSError:
+                                dn = ""
                     except OSError:
                         continue
-                    skl = sk_name.lower()
-                    if not any(t == skl or t in skl for t in tokens):
+                    if dn and _res_hit(dn, full, words):
+                        out.append({"hive": hive, "path": sub + "\\" + key, "tag": "卸载项"})
+                        if len(out) >= cap:
+                            return out
+        except OSError:
+            continue
+    return out
+
+
+def _scan_reg_startup(full, words, cap):
+    """Run / RunOnce 启动项里的残留（值名或可执行名匹配）。
+
+    结构里 path=键路径、value=值名（**不拼箭头** —— UI 曾用「sub  →  值名」拼成
+    字符串，回传时既解析不出 hive 也定位不到值，导致勾选后删不掉）。
+    """
+    out = []
+    for hive, sub in STARTUP_LOCATIONS:
+        root = winreg.HKEY_LOCAL_MACHINE if hive == "HKLM" else winreg.HKEY_CURRENT_USER
+        try:
+            with winreg.OpenKey(root, sub, 0, winreg.KEY_READ) as k:
+                for i in range(winreg.QueryInfoKey(k)[1]):
+                    try:
+                        vn, vd, _t = winreg.EnumValue(k, i)
+                    except OSError:
                         continue
-                    regs.append({"hive": hive, "path": sub + "\\" + sk_name})
-                    if len(regs) >= cap:
+                    exe_name = os.path.basename(str(vd).strip('"').split()[0].strip('"')) \
+                        if str(vd).strip() else ""
+                    if _res_hit(vn, full, words) or (exe_name and
+                                                     _res_hit(os.path.splitext(exe_name)[0],
+                                                              full, words)):
+                        out.append({"hive": hive, "path": sub, "value": vn,
+                                    "tag": "启动项"})
+                        if len(out) >= cap:
+                            return out
+        except OSError:
+            continue
+    return out
+
+
+def _scan_reg_services(full, words, cap):
+    """服务键残留（键名匹配）。勾选后可按 _REG_DEL_RULES 精确删除。"""
+    out = []
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                            r"SYSTEM\CurrentControlSet\Services", 0, winreg.KEY_READ) as k:
+            for i in range(winreg.QueryInfoKey(k)[0]):
+                try:
+                    sn = winreg.EnumKey(k, i)
+                except OSError:
+                    continue
+                if _res_hit(sn, full, words):
+                    out.append({"hive": "HKLM",
+                                "path": r"SYSTEM\CurrentControlSet\Services" + "\\" + sn,
+                                "tag": "服务"})
+                    if len(out) >= cap:
                         break
-            finally:
-                winreg.CloseKey(k)
-            if len(regs) >= cap:
+    except OSError:
+        pass
+    return out
+
+
+class _CREDENTIAL(ctypes.Structure):
+    """Windows 凭据管理器条目（CredEnumerateW 返回结构）。"""
+    _fields_ = [
+        ("Flags", wt.DWORD),
+        ("Type", wt.DWORD),
+        ("TargetName", wt.LPWSTR),
+        ("Comment", wt.LPWSTR),
+        ("LastWritten", wt.FILETIME),
+        ("CredentialBlobSize", wt.DWORD),
+        ("CredentialBlob", ctypes.POINTER(ctypes.c_byte)),
+        ("Persist", wt.DWORD),
+        ("AttributeCount", wt.DWORD),
+        ("Attributes", ctypes.c_void_p),
+        ("TargetAlias", wt.LPWSTR),
+        ("UserName", wt.LPWSTR),
+    ]
+
+
+def _scan_reg_eventlog(full, words, cap):
+    """事件日志源残留：安装程序常往 Application 日志注册源，卸载后常留下。"""
+    out = []
+    base = r"SYSTEM\CurrentControlSet\Services\EventLog\Application"
+    if winreg is None:
+        return out
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base, 0, winreg.KEY_READ) as k:
+            for i in range(winreg.QueryInfoKey(k)[0]):
+                try:
+                    nm = winreg.EnumKey(k, i)
+                except OSError:
+                    continue
+                if _res_hit(nm, full, words):
+                    out.append({"hive": "HKLM", "path": base + "\\" + nm,
+                                "tag": "日志源"})
+                    if len(out) >= cap:
+                        break
+    except OSError:
+        pass
+    return out
+
+
+def _scan_credentials(full, words, cap):
+    """Windows 凭据管理器里的**登录凭据**（登录数据的典型残留位置）。
+
+    列出所有 TargetName（如 `git:https://github.com`、
+    `LegacyGeneric:target=XXX`），按程序 token 匹配；删除走 CredDeleteW。
+    """
+    out = []
+    try:
+        adv = ctypes.windll.advapi32
+        cnt = wt.DWORD(0)
+        arr = ctypes.POINTER(ctypes.POINTER(_CREDENTIAL))()
+        if not adv.CredEnumerateW(None, 0, ctypes.byref(cnt), ctypes.byref(arr)):
+            return out
+        try:
+            for i in range(cnt.value):
+                try:
+                    c = arr[i].contents
+                except (ValueError, OSError):
+                    continue
+                target = c.TargetName or ""
+                short = re.sub(r"^LegacyGeneric:target=", "", target, flags=re.I)
+                if _res_hit(short, full, words) or _res_hit(target, full, words):
+                    out.append({"hive": "CRED", "path": target, "kind": "cred",
+                                "ctype": int(c.Type), "value": c.UserName or "",
+                                "tag": "登录凭据"})
+                    if len(out) >= cap:
+                        break
+        finally:
+            adv.CredFree(arr)
+    except Exception:
+        pass
+    return out
+
+
+def _scan_tasks(full, words, cap):
+    """计划任务残留：卸载程序常在计划任务里留下自动更新/守护任务。
+    `\\Microsoft\\...` 开头的系统任务一律跳过。"""
+    out = []
+    try:
+        rc, o = run(["schtasks", "/query", "/fo", "csv", "/nh"], timeout=60)
+    except Exception:
+        return out
+    for line in (o or "").splitlines():
+        m = re.match(r'\s*"([^"]+)"', line)
+        if not m:
+            continue
+        name = m.group(1).lstrip("\\")
+        if not name or name.lower().startswith("microsoft\\"):
+            continue
+        if _res_hit(name.split("\\")[-1], full, words):
+            out.append({"hive": "TASK", "path": name, "kind": "task",
+                        "tag": "计划任务"})
+            if len(out) >= cap:
                 break
-    return {"files": files, "reg": regs, "tokens": sorted(tokens)}
+    return out
+
+
+def _cred_exists(target, ctype=1):
+    """该凭据是否仍在（快照复查用）。"""
+    if not target:
+        return False
+    try:
+        adv = ctypes.windll.advapi32
+        p = ctypes.POINTER(_CREDENTIAL)()
+        if adv.CredReadW(ctypes.c_wchar_p(target), int(ctype or 1), 0,
+                         ctypes.byref(p)):
+            adv.CredFree(p)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _task_exists(name):
+    if not name:
+        return False
+    try:
+        rc, _o = run(["schtasks", "/query", "/tn", name], timeout=30)
+        return rc == 0
+    except Exception:
+        return False
+
+
+def _item_exists(it):
+    """快照项是否仍然存在（按 kind 分派到各自的检查方式）。"""
+    kind = (it or {}).get("kind") or "reg"
+    if kind == "cred":
+        return _cred_exists(it.get("path"), it.get("ctype") or 1)
+    if kind == "task":
+        return _task_exists(it.get("path"))
+    return _reg_key_exists(it.get("hive"), it.get("path"), it.get("value") or "")
+
+
+def install_dir_candidates(key_path="", location="", uninstall_cmd=""):
+    """多来源推断安装目录（对齐 Geek 的 CInstallLocationFinder 思路）：
+    InstallLocation → 注册表 Inno Setup: App Path / App Path（Inno / InstallShield
+    常写这两个值）→ 卸载程序所在目录。只返回当前仍存在的目录。"""
+    dirs = []
+    if location:
+        dirs.append(location)
+    if key_path and winreg is not None:
+        hive_s, _, rest = key_path.partition("\\")
+        root = {"HKLM": winreg.HKEY_LOCAL_MACHINE,
+                "HKCU": winreg.HKEY_CURRENT_USER}.get(hive_s)
+        if root and rest:
+            for flag in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
+                try:
+                    with winreg.OpenKey(root, rest, 0, winreg.KEY_READ | flag) as k:
+                        for vn in ("Inno Setup: App Path", "InstallLocation", "App Path"):
+                            try:
+                                dirs.append(str(winreg.QueryValueEx(k, vn)[0]))
+                            except OSError:
+                                pass
+                    break
+                except OSError:
+                    continue
+    try:
+        exe, _a = parse_uninstall_cmd(uninstall_cmd or "")
+        sysroot = os.environ.get("SystemRoot", r"C:\Windows").lower()
+        if exe and os.path.isabs(exe) and not exe.lower().startswith(sysroot):
+            dirs.append(os.path.dirname(exe))
+    except Exception:
+        pass
+    out, seen = [], set()
+    for d in dirs:
+        d = os.path.expandvars((d or "").strip().strip('"')).rstrip("\\/")
+        if d and d.lower() not in seen and os.path.isdir(d):
+            seen.add(d.lower())
+            out.append(d)
+    return out
+
+
+def _scan_msi_folders(full, words, cap):
+    """MSI 安装目录索引（Geek 同样读这个键）：值名即目录路径，
+    命中程序名且目录仍在 → MSI 卸载残留。返回目录路径列表（并入文件项）。"""
+    out = []
+    sub = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\Folders"
+    for flag in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, sub, 0,
+                                winreg.KEY_READ | flag) as k:
+                for i in range(winreg.QueryInfoKey(k)[1]):
+                    try:
+                        vn, _vd, _t = winreg.EnumValue(k, i)
+                    except OSError:
+                        continue
+                    d = (vn or "").rstrip("\\")
+                    base = os.path.basename(d)
+                    if base and _res_hit(base, full, words) and os.path.isdir(d):
+                        out.append(d)
+                        if len(out) >= cap:
+                            return out
+        except OSError:
+            continue
+    return out
+
+
+def _reg_key_exists(hive_s, sub, value=""):
+    """注册表项是否还存在（64/32 视图都试）。
+
+    value 非空时判断的是「该值名是否存在于 sub 键下」（启动项是「键 → 值名」，
+    键永远在、只有值会被清掉）。
+    """
+    if winreg is None or not sub:
+        return False
+    root = {"HKLM": winreg.HKEY_LOCAL_MACHINE, "HKCU": winreg.HKEY_CURRENT_USER}.get(hive_s)
+    if root is None:
+        return False
+    for flag in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
+        try:
+            with winreg.OpenKey(root, sub, 0, winreg.KEY_READ | flag) as k:
+                if not value:
+                    return True
+                try:
+                    winreg.QueryValueEx(k, value)
+                    return True
+                except OSError:
+                    continue
+        except OSError:
+            continue
+    return False
+
+
+# 注册表残留的可删范围：按 tag 精确校验，绝不按「路径层数」一刀切 ——
+# 旧实现只放行 SOFTWARE\<一层>，导致「产品键」(两层)、「卸载项」(4 层)、
+# 「启动项」(带值名)、「服务」全被拒绝：扫得到、删不掉，用户点删除只会看到
+# 「拒绝（超出安全范围）」。现在逐类给出各自的精确模式。
+_REG_DEL_RULES = (
+    # (tag, 路径正则, 是否删值)
+    ("厂商键", r"^SOFTWARE(?:\\WOW6432Node)?\\[^\\]+$", False),
+    ("产品键", r"^SOFTWARE(?:\\WOW6432Node)?\\[^\\]+\\[^\\]+$", False),
+    ("卸载项", r"^SOFTWARE\\(?:WOW6432Node\\)?Microsoft\\Windows\\"
+              r"CurrentVersion\\Uninstall\\[^\\]+$", False),
+    ("启动项", r"^SOFTWARE\\(?:WOW6432Node\\)?Microsoft\\Windows\\"
+              r"CurrentVersion\\Run(?:Once)?$", True),
+    ("服务", r"^SYSTEM\\CurrentControlSet\\Services\\[^\\]+$", False),
+    ("日志源", r"^SYSTEM\\CurrentControlSet\\Services\\EventLog\\Application\\[^\\]+$",
+     False),
+)
+
+
+def _reg_del_ok(entry):
+    """该项是否在可删除范围内（返回 (ok, 是否删值)）。"""
+    if entry.get("hive") not in ("HKLM", "HKCU"):
+        return False, False
+    path = (entry.get("path") or "").strip()
+    tag = entry.get("tag") or ""
+    # 卸载前已有：按通用规则试（这类项本来是扫描产物，形态与上面一致）
+    rules = [r for r in _REG_DEL_RULES if r[0] == tag] or list(_REG_DEL_RULES)
+    for _t, pat, is_value in rules:
+        if re.match(pat, path, re.I):
+            if is_value and not (entry.get("value") or "").strip():
+                continue          # 启动项没有值名 → 不知道删什么，拒绝
+            return True, is_value
+    return False, False
+
+
+_SOFT_SNAP = {}
+
+
+def snapshot_before(key_path, name, publisher="", location="", uninstall_cmd=""):
+    """卸载前基线（HiBit 的 first snapshot 思路）：记录当前与程序相关的
+    目录与注册表项。卸载后复查其中**仍存在**的项 —— 语义上就是确定的残留。"""
+    r = residual_scan(name, publisher, location, uninstall_cmd, key_path, cap=80)
+    _SOFT_SNAP[key_path or name] = {
+        "files": [f["path"] for f in r.get("files") or []],
+        "reg": r.get("reg") or [],
+        "t": time.time(),
+    }
+    return {"files": len(r.get("files") or []), "reg": len(r.get("reg") or [])}
+
+
+def snapshot_get(key_path, name=""):
+    return _SOFT_SNAP.get(key_path or name)
+
+
+def residual_scan(name, publisher="", location="", uninstall_cmd="",
+                  key_path="", base=None, cap=80):
+    """卸载后的残留扫描：只定位、不删除。返回 {"files", "reg", "tokens"}。
+
+    覆盖范围（对齐 HiBit / Geek 的检查位置）：
+      目录：安装目录多来源（InstallLocation / Inno Setup: App Path / 卸载程序目录）、
+            ProgramFiles(+x86) / ProgramData / LOCALAPPDATA / LOCALAPPDATA\\Programs /
+            APPDATA / LocalLow（两层）、各盘根目录、桌面与开始菜单快捷方式、
+            **启动文件夹**、Recent 使用痕迹（一层）、**用户主目录点目录**（.vscode 等）、
+            WER 崩溃报告（两层）；
+      注册表：SOFTWARE（含 WOW6432Node）两层、四处已安装列表、MSI Installer\\Folders
+              索引、Run/RunOnce 启动项、服务键、**事件日志源**；
+      登录数据 / 守护：**Windows 凭据管理器**（CredEnumerateW，按程序名匹配 target）、
+              **计划任务**（schtasks，系统任务除外）；
+      base： 卸载前快照 —— 其中**仍存在**的项标记为「卸载前已有」（确定残留）。
+    """
+    dir_dirs = install_dir_candidates(key_path, location, uninstall_cmd)
+    extra = [os.path.basename(d.rstrip("\\/")) for d in dir_dirs if d]
+    full, words = _res_tokens(name, publisher, extra)
+
+    files, seen = [], set()
+
+    def add(path, tag, weak=False):
+        key = os.path.abspath(path).lower()
+        if key in seen:
+            return
+        seen.add(key)
+        try:
+            sz = dir_size(path, cap=8000)[0] if os.path.isdir(path) else os.path.getsize(path)
+        except OSError:
+            sz = 0
+        files.append({"path": path, "kind": "dir" if os.path.isdir(path) else "file",
+                      "bytes": sz, "tag": tag, "weak": weak})
+
+    # 0) 卸载前快照中仍存在的项 —— 语义上最确定的残留，放最前
+    if base:
+        for p in base.get("files") or []:
+            if os.path.exists(p):
+                add(p, "卸载前已有")
+
+    # 1) 安装目录 / 卸载程序目录仍在 → 最典型的残留
+    for d in dir_dirs:
+        add(d, "安装目录")
+
+    # 2) 常见位置扫描
+    roots = []
+    for kk in ("ProgramFiles", "ProgramFiles(x86)", "ProgramData",
+               "LOCALAPPDATA", "APPDATA"):
+        p = os.environ.get(kk)
+        if p and os.path.isdir(p):
+            roots.append((p, "程序目录" if kk.startswith("ProgramFiles") else "用户数据"))
+    local = os.environ.get("LOCALAPPDATA") or ""
+    if local and os.path.isdir(os.path.join(local, "Programs")):
+        roots.append((os.path.join(local, "Programs"), "用户程序目录"))
+    for drive in ("C", "D", "E", "F"):
+        r = drive + ":\\"
+        if os.path.isdir(r):
+            roots.append((r, "磁盘根目录"))
+
+    # 快捷方式 / 使用痕迹 / 崩溃报告
+    up = os.environ.get("USERPROFILE") or ""
+    dat = os.environ.get("ProgramData") or ""
+    shallow = [
+        (os.path.join(up, "Desktop"), "桌面快捷方式", 1),
+        (os.path.join(os.environ.get("PUBLIC") or r"C:\Users\Public", "Desktop"),
+         "桌面快捷方式", 1),
+        (os.path.join(up, r"AppData\Roaming\Microsoft\Windows\Start Menu\Programs"),
+         "开始菜单", 1),
+        # 启动文件夹（开机自启的快捷方式，卸载后常残留）
+        (os.path.join(up, r"AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"),
+         "启动文件夹", 1),
+        (os.path.join(dat, r"Microsoft\Windows\Start Menu\Programs\Startup"),
+         "启动文件夹", 1),
+        (os.path.join(up, r"AppData\Roaming\Microsoft\Windows\Recent"), "使用痕迹", 1),
+        (os.path.join(up, r"AppData\LocalLow"), "用户数据", 2),
+        (os.path.join(dat, r"Microsoft\Windows\WER"), "崩溃报告", 2),
+        (os.path.join(local, r"Microsoft\Windows\WER"), "崩溃报告", 2),
+    ]
+
+    for bdir, tag in roots:
+        depth = 1 if tag == "磁盘根目录" else 2
+        for path, _lv in _walk2(bdir, depth):
+            if len(files) >= cap:
+                break
+            sc = _res_score(os.path.basename(path), full, words)
+            if sc:
+                add(path, tag, weak=(sc == 1))
+        if len(files) >= cap:
+            break
+    for bdir, tag, depth in shallow:
+        if len(files) >= cap or not bdir or not os.path.isdir(bdir):
+            continue
+        for path, _lv in _walk2(bdir, depth):
+            nm = os.path.splitext(os.path.basename(path))[0]   # 快捷方式去 .lnk
+            sc = _res_score(nm, full, words)
+            if sc:
+                add(path, tag, weak=(sc == 1))
+
+    # 2.5) 用户主目录下的点目录（.vscode / .android / .gradle / .config …）——
+    # 工具类程序把配置与登录态放这里，卸载后常整目录留下。
+    if up and os.path.isdir(up):
+        try:
+            for nm in os.listdir(up):
+                if len(files) >= cap:
+                    break
+                if not nm.startswith(".") or len(nm) < 3:
+                    continue
+                sc = _res_score(nm, full, words)
+                if sc:
+                    add(os.path.join(up, nm), "用户配置", weak=(sc == 1))
+        except OSError:
+            pass
+
+    # 3) 注册表 + MSI 目录索引 + 登录凭据 + 计划任务
+    regs = []
+    if winreg is not None and (full or words):
+        regs += _scan_reg_products(full, words, cap)
+        regs += _scan_reg_arp(full, words, cap)
+        for p in _scan_msi_folders(full, words, cap):     # 目录 → 并入文件项
+            add(p, "MSI 目录")
+        regs += _scan_reg_startup(full, words, cap)
+        regs += _scan_reg_services(full, words, cap)
+        regs += _scan_reg_eventlog(full, words, cap)
+        regs += _scan_credentials(full, words, cap)       # 登录数据
+        regs += _scan_tasks(full, words, cap)
+        if base:
+            for rg in base.get("reg") or []:
+                if _item_exists(rg):
+                    item = {k: rg.get(k) for k in
+                            ("hive", "path", "value", "kind", "ctype")
+                            if rg.get(k) is not None}
+                    item["tag"] = "卸载前已有"
+                    regs.append(item)
+    uniq, seen_reg = [], set()
+    for rg in [r for r in regs if r.get("tag") == "卸载前已有"] + regs:
+        k = (rg.get("hive"), rg.get("path"))
+        if k in seen_reg:
+            continue
+        seen_reg.add(k)
+        uniq.append(rg)
+    return {"files": files, "reg": uniq[:cap], "tokens": sorted(full | words)}
 
 
 def residual_clean(files, regs):
@@ -709,11 +1863,29 @@ def residual_clean(files, regs):
     allowed_roots = [os.path.abspath(os.environ.get(k, "")).lower() for k in
                      ("ProgramFiles", "ProgramFiles(x86)", "ProgramData",
                       "LOCALAPPDATA", "APPDATA")]
+    # 新增扫描位置对应的可删范围：LocalLow、用户/公共桌面、开始菜单快捷方式
+    up = os.environ.get("USERPROFILE") or ""
+    for extra in (os.path.join(up, "AppData", "LocalLow"),
+                  os.path.join(up, "Desktop"),
+                  os.path.join(os.environ.get("PUBLIC") or r"C:\Users\Public", "Desktop")):
+        if extra and os.path.isdir(extra):
+            allowed_roots.append(os.path.abspath(extra).lower())
     allowed_roots = [r for r in allowed_roots if r]
+    # 磁盘根：扫描覆盖了 C/D/E/F 根下的直接子项（如 D:\SomeApp），删除范围
+    # 必须与之对齐 —— 否则又是「扫得到、删不掉」。只放行**直接子项**，
+    # 盘根本身永远不可删。
+    # 注意统一小写：pl 已 lowercase，盘符若留大写会永远匹配不上
+    drive_roots = [(d + ":\\").lower() for d in ("C", "D", "E", "F", "G")
+                   if os.path.isdir(d + ":\\")]
     for it in files or []:
         p = (it.get("path") or "").strip()
         pl = os.path.abspath(p).lower()
-        if not any(pl.startswith(r + os.sep) for r in allowed_roots):
+        okp = any(pl.startswith(r + os.sep) for r in allowed_roots)
+        if not okp:
+            par = os.path.dirname(pl)
+            okp = (pl.rstrip("\\") != par.rstrip("\\") and
+                   any(par.rstrip("\\") == r.rstrip("\\") for r in drive_roots))
+        if not okp:
             msgs.append("拒绝（不在允许的目录内）：%s" % p)
             ok = False
             continue
@@ -727,22 +1899,447 @@ def residual_clean(files, regs):
             ok = False
             msgs.append("失败：%s（%s）" % (p, str(e)[:80]))
     for it in regs or []:
+        kind = it.get("kind") or "reg"
+        if kind == "cred":
+            target = (it.get("path") or "").strip()
+            if it.get("hive") != "CRED" or not target:
+                msgs.append("拒绝（凭据项无效）：%s" % target)
+                ok = False
+                continue
+            try:
+                rc = ctypes.windll.advapi32.CredDeleteW(
+                    ctypes.c_wchar_p(target), int(it.get("ctype") or 1), 0)
+                if rc:
+                    msgs.append("已删除登录凭据：%s" % target)
+                else:
+                    ok = False
+                    msgs.append("删除凭据失败（可能被系统保护）：%s" % target)
+            except Exception as e:
+                ok = False
+                msgs.append("失败：%s（%s）" % (target, str(e)[:60]))
+            continue
+        if kind == "task":
+            name = (it.get("path") or "").strip()
+            if it.get("hive") != "TASK" or not name or \
+                    name.lower().startswith("microsoft\\"):
+                msgs.append("拒绝（系统任务不可删）：%s" % name)
+                ok = False
+                continue
+            try:
+                rc, o = run(["schtasks", "/delete", "/tn", name, "/f"], timeout=60)
+                if rc == 0:
+                    msgs.append("已删除计划任务：%s" % name)
+                else:
+                    ok = False
+                    msgs.append("删除任务失败：%s（%s）"
+                                % (name, (o or "").strip()[:60]))
+            except Exception as e:
+                ok = False
+                msgs.append("失败：%s（%s）" % (name, str(e)[:60]))
+            continue
         hive = it.get("hive")
         path = (it.get("path") or "").strip()
-        # 安全闸：只允许删 SOFTWARE 与 SOFTWARE\WOW6432Node 的第一层子键
-        if hive not in ("HKLM", "HKCU") or \
-                not re.match(r"^SOFTWARE(\\WOW6432Node)?\\[^\\]+$", path, re.I):
+        value = (it.get("value") or "").strip()
+        allowed, is_value = _reg_del_ok(it)
+        if not allowed:
             msgs.append("拒绝（超出安全范围）：%s\\%s" % (hive, path))
             ok = False
             continue
         root = winreg.HKEY_LOCAL_MACHINE if hive == "HKLM" else winreg.HKEY_CURRENT_USER
         try:
-            _delete_tree(root, path)
-            msgs.append("已删除注册表：HK%s\\%s" % ("LM" if hive == "HKLM" else "CU", path))
+            if is_value:
+                # 启动项：键是系统的，只能删自己那个值
+                with winreg.OpenKey(root, path, 0,
+                                    winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY) as k:
+                    winreg.DeleteValue(k, value)
+                msgs.append("已删除启动项：HK%s\\%s → %s"
+                            % ("LM" if hive == "HKLM" else "CU", path, value))
+            else:
+                _delete_tree(root, path)
+                msgs.append("已删除注册表：HK%s\\%s"
+                            % ("LM" if hive == "HKLM" else "CU", path))
         except Exception as e:
             ok = False
             msgs.append("失败：%s\\%s（%s）" % (hive, path, str(e)[:80]))
     return {"ok": ok, "msg": msgs}
+
+
+# --------------------------------------------------------------------------
+# 全机「卸载残留」扫描（参照 BCUninstaller 的 Orphan / Leftover 检测）
+#
+# 与 residual_scan 的分工：那个是「卸载某个程序之后」针对它的复查；
+# 本函数不需要任何选中项，直接找整机里**已经失去主人**的东西：
+#   A 孤儿卸载项  —— ARP 里有条目，但它的卸载程序已经不存在了（最确定的残留）
+#   B 孤儿启动项 / 孤儿服务 —— 指向的可执行文件已不存在
+#   C 失效快捷方式 —— 桌面 / 开始菜单里指向不存在目标的 .lnk
+#   D 疑似残留目录 —— 常见位置下没有任何已注册程序认领的目录（需人工确认，
+#      默认不勾选；BCUninstaller 对同类结果同样标为 Questionable）
+# 结果结构与 residual_scan 一致，可直接交给同一个清理对话框（复用安全白名单）。
+# --------------------------------------------------------------------------
+_IMMUNE_DIRS = {
+    "windows", "windowsapps", "winsxs", "temp", "tmp", "cache", "drivers",
+    # 容器型目录：它们只是"放东西的地方"，本身永远不是程序残留
+    "programs", "program files", "packages", "downloads", "documents",
+    "desktop", "appdata", "local", "roaming", "locallow", "public", "default",
+    "common files", "internet explorer", "windows nt", "windows defender",
+    "windows mail", "windows media player", "windows portable devices",
+    "windows security", "windows photo viewer", "windows sidebar",
+    "microsoft", "microsoft corporation", "microsoft office", "microsoft edge",
+    "microsoft.net", "msbuild", "reference assemblies", "windows kits",
+    "uninstall information", "installshield installation information",
+    "package cache", "nvidia", "nvidia corporation", "intel", "amd", "realtek",
+    "google", "mozilla", "apple", "adobe", "all users",
+    "modifiablewindowsapps", "systemapps", "node_modules", "dotnet",
+    "windows powershell", "crashdumps", "connecteddevicesplatform",
+}
+# 目录名"像系统本体"的前缀：windows* / microsoft* 一律不碰
+_IMMUNE_PREFIXES = ("windows", "microsoft", "system32", "syswow64", "$", ".")
+
+
+def _norm_path(p):
+    """规范化路径用于比对（小写、去尾部分隔符、展开环境变量）。"""
+    try:
+        s = os.path.expandvars((p or "").strip().strip('"'))
+        if not s:
+            return ""
+        return os.path.normcase(os.path.abspath(s)).rstrip("\\/")
+    except Exception:
+        return ""
+
+
+def orphan_index():
+    """已装程序索引。
+
+    claimed：被「有主」的东西认领的目录 —— ARP 的 InstallLocation / 卸载程序目录 /
+             图标目录 + MSI 安装目录索引 + 所有服务的 ImagePath 目录 +
+             启动项 Exe 目录。多来源认领是精度的关键：只看 InstallLocation 会把
+             Logitech G HUB、SQL Server、MuMu 这类没写 InstallLocation 的程序
+             全报成「残留目录」（实测 111 个里大半是这类误报）。
+    toks：   所有已装软件名/发布者的特征词，供目录名比对。
+    """
+    claimed, toks = set(), set()
+    inst = list_software()
+    for it in inst:
+        for src in (it.get("name"), it.get("publisher")):
+            full, _w = _res_tokens(src or "", "")
+            toks |= full
+        loc = _norm_path(it.get("location"))
+        if loc:
+            claimed.add(loc)
+        icon = (it.get("icon") or "").split(",")[0].strip().strip('"')
+        if icon:
+            d = _norm_path(os.path.dirname(icon))
+            if d:
+                claimed.add(d)
+        for cmd in (it.get("uninstall"), it.get("quiet")):
+            exe, _a = parse_uninstall_cmd(cmd or "")
+            if exe and os.path.isabs(exe):
+                d = _norm_path(os.path.dirname(exe))
+                if d:
+                    claimed.add(d)
+    claimed |= _msi_folder_dirs()
+    claimed |= _svc_image_dirs()
+    claimed |= _startup_dirs()
+    return claimed, toks, inst
+
+
+def _orphan_entries(inst, cap):
+    """A. 孤儿卸载项：卸载程序文件已不存在（MSI 条目由系统维护，跳过）。"""
+    out = []
+    for it in inst:
+        cmd = it.get("uninstall") or it.get("quiet") or ""
+        key = it.get("key") or ""
+        if not cmd or "msiexec" in cmd.lower():
+            continue
+        exe, _a = parse_uninstall_cmd(cmd)
+        if not exe or not os.path.isabs(exe) or os.path.exists(exe):
+            continue
+        hive, _, rest = key.partition("\\")
+        out.append({"hive": hive, "path": rest, "tag": "孤儿卸载项",
+                    "value": it.get("name") or "", "missing": exe})
+        if len(out) >= cap:
+            break
+    return out
+
+
+def _svc_exe(img):
+    """服务 ImagePath → 可执行文件绝对路径。
+
+    解析不确定时返回 ""（宁可漏报也不误报）：无引号且含空格的路径无法可靠切分，
+    这类直接放弃 —— 否则 `C:\\Program Files\\...` 会被截成 `C:\\Program`，
+    把仍在运行的服务误报成孤儿（实测 edgeupdate / MySQL80 等大面积误报）。
+    """
+    s = str(img or "").strip()
+    if not s:
+        return ""
+    m = re.match(r'^"([^"]+)"', s)           # "C:\...\x.exe" -k
+    if m:
+        s = m.group(1)
+    else:
+        s = s.split(" ")[0] if " " in s else s
+    s = s.strip('"')
+    sysroot = os.environ.get("SystemRoot", r"C:\Windows")
+    s = re.sub(r"^\\\?\?\\", "", s)          # \??\C:\... → C:\...
+    low = s.lower()
+    if low.startswith("\\systemroot\\"):     # \SystemRoot\System32\... → C:\Windows
+        s = os.path.join(sysroot, s[len("\\systemroot\\"):])
+    elif low.startswith("system32\\"):
+        s = os.path.join(sysroot, s)
+    s = os.path.expandvars(s)
+    if not re.search(r"\.(?:exe|sys|dll)$", s, re.I):
+        return ""
+    return s
+
+
+def _svc_image_dirs():
+    """所有服务的 ImagePath 所在目录（有服务的程序目录不该被当成残留目录）。"""
+    dirs = set()
+    if winreg is None:
+        return dirs
+    base = r"SYSTEM\CurrentControlSet\Services"
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base, 0, winreg.KEY_READ) as k:
+            for i in range(winreg.QueryInfoKey(k)[0]):
+                try:
+                    sn = winreg.EnumKey(k, i)
+                    with winreg.OpenKey(k, sn) as sk:
+                        img = str(winreg.QueryValueEx(sk, "ImagePath")[0])
+                except OSError:
+                    continue
+                exe = _svc_exe(img)
+                if exe and os.path.isabs(exe):
+                    d = _norm_path(os.path.dirname(exe))
+                    if d:
+                        dirs.add(d)
+    except OSError:
+        pass
+    return dirs
+
+
+def _startup_dirs():
+    """启动项指向的目录（有自启动的程序目录不该被当成残留目录）。"""
+    dirs = set()
+    if winreg is None:
+        return dirs
+    for hive, sub in STARTUP_LOCATIONS:
+        root = winreg.HKEY_LOCAL_MACHINE if hive == "HKLM" else winreg.HKEY_CURRENT_USER
+        try:
+            with winreg.OpenKey(root, sub, 0, winreg.KEY_READ) as k:
+                for i in range(winreg.QueryInfoKey(k)[1]):
+                    try:
+                        _vn, vd, _t = winreg.EnumValue(k, i)
+                    except OSError:
+                        continue
+                    exe, _a = parse_uninstall_cmd(str(vd))
+                    if exe and os.path.isabs(exe):
+                        d = _norm_path(os.path.dirname(exe))
+                        if d:
+                            dirs.add(d)
+        except OSError:
+            continue
+    return dirs
+
+
+def _msi_folder_dirs():
+    """MSI 安装目录索引（`Installer\\Folders` 的值名即目录路径）——
+    MSI 装的程序大多不写 InstallLocation，靠这个索引认领它们的目录。"""
+    dirs = set()
+    if winreg is None:
+        return dirs
+    sub = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\Folders"
+    for flag in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, sub, 0,
+                                winreg.KEY_READ | flag) as k:
+                for i in range(winreg.QueryInfoKey(k)[1]):
+                    try:
+                        vn, _vd, _t = winreg.EnumValue(k, i)
+                    except OSError:
+                        continue
+                    d = _norm_path(vn)
+                    if d:
+                        dirs.add(d)
+        except OSError:
+            continue
+    return dirs
+
+
+def _orphan_startup(cap):
+    """B. 孤儿启动项：Run/RunOnce 的值指向不存在的可执行文件。"""
+    out = []
+    if winreg is None:
+        return out
+    for hive, sub in STARTUP_LOCATIONS:
+        root = winreg.HKEY_LOCAL_MACHINE if hive == "HKLM" else winreg.HKEY_CURRENT_USER
+        try:
+            with winreg.OpenKey(root, sub, 0, winreg.KEY_READ) as k:
+                for i in range(winreg.QueryInfoKey(k)[1]):
+                    try:
+                        vn, vd, _t = winreg.EnumValue(k, i)
+                    except OSError:
+                        continue
+                    if _exe_from_path(vd):          # 目标还在
+                        continue
+                    exe, _a = parse_uninstall_cmd(str(vd))
+                    if not exe or not os.path.isabs(exe) or os.path.exists(exe):
+                        continue                    # 系统命令 / 相对路径，不动
+                    out.append({"hive": hive, "path": sub, "value": vn,
+                                "tag": "孤儿启动项"})
+                    if len(out) >= cap:
+                        return out
+        except OSError:
+            continue
+    return out
+
+
+def _orphan_services(cap):
+    """B. 孤儿服务：ImagePath 指向的可执行文件已不存在。"""
+    out = []
+    base = r"SYSTEM\CurrentControlSet\Services"
+    if winreg is None:
+        return out
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base, 0, winreg.KEY_READ) as k:
+            for i in range(winreg.QueryInfoKey(k)[0]):
+                try:
+                    sn = winreg.EnumKey(k, i)
+                except OSError:
+                    continue
+                if sn.lower() in _SKIP_ENTRIES:
+                    continue
+                try:
+                    with winreg.OpenKey(k, sn) as sk:
+                        try:
+                            img = str(winreg.QueryValueEx(sk, "ImagePath")[0])
+                        except OSError:
+                            continue
+                except OSError:
+                    continue
+                exe = _svc_exe(img)
+                if not exe or not os.path.isabs(exe) or os.path.exists(exe):
+                    continue
+                out.append({"hive": "HKLM", "path": base + "\\" + sn,
+                            "tag": "孤儿服务", "value": exe})
+                if len(out) >= cap:
+                    break
+    except OSError:
+        pass
+    return out
+
+
+def _orphan_dirs(claimed, toks, cap):
+    """D. 疑似残留目录：常见位置下无人认领的目录（低置信 → 默认不勾选）。"""
+    out = []
+    roots = []
+    for kk in ("ProgramFiles", "ProgramFiles(x86)", "ProgramData",
+               "LOCALAPPDATA", "APPDATA", "USERPROFILE"):
+        p = os.environ.get(kk)
+        if p and os.path.isdir(p):
+            roots.append(p)
+    local = os.environ.get("LOCALAPPDATA") or ""
+    if local and os.path.isdir(os.path.join(local, "Programs")):
+        roots.append(os.path.join(local, "Programs"))
+    for drive in ("C", "D", "E", "F", "G"):
+        r = drive + ":\\"
+        if os.path.isdir(r):
+            roots.append(r)
+    # 收集阶段放宽，最后按体积取前 N —— 边扫边截断会留下"先扫到的小目录"，
+    # 用户最该看到的大块残留反而进不来
+    scan_limit = max(60, min(150, cap * 4))
+    for base in roots:
+        try:
+            names = os.listdir(base)
+        except OSError:
+            continue
+        for nm in names:
+            if len(out) >= scan_limit:
+                break
+            full = os.path.join(base, nm)
+            if not os.path.isdir(full) or os.path.islink(full):
+                continue
+            nml = nm.lower()
+            if nml in _SKIP_ENTRIES or nml in _IMMUNE_DIRS:
+                continue
+            if nml.startswith(_IMMUNE_PREFIXES):
+                continue
+            np = _norm_path(full)
+            if not np:
+                continue
+            if np in claimed or any(np.startswith(c + os.sep) for c in claimed):
+                continue                       # 有程序认领（是它的安装目录）
+            if _res_score(nm, toks, set()) > 0:  # 名字与某个已装软件一致 → 有主
+                continue
+            # 子串认领：目录名与已装软件名互为子串也算有主
+            # （如 "Code" ↔ "Visual Studio Code"、"dingtalk" ↔ "DingTalk 钉钉"）
+            nmn = re.sub(r"[^\w\u4e00-\u9fff]+", "", nml)
+            if len(nmn) >= 4 and any(len(t) >= 4 and (nmn in t or t in nmn)
+                                     for t in toks):
+                continue
+            try:
+                sz = dir_size(full, cap=600)[0]
+            except Exception:
+                sz = 0
+            out.append({"path": full, "kind": "dir", "bytes": sz,
+                        "tag": "疑似残留目录", "weak": True})
+    # 体积大的更值得看；总数收紧，避免对话框被低置信噪音淹没
+    out.sort(key=lambda x: -x["bytes"])
+    return out[:min(cap, 45)]
+
+def _broken_shortcuts(cap):
+    """C. 失效快捷方式：桌面 / 开始菜单里指向不存在目标的 .lnk。"""
+    out = []
+    up = os.environ.get("USERPROFILE") or ""
+    pub = os.environ.get("PUBLIC") or r"C:\Users\Public"
+    dat = os.environ.get("ProgramData") or ""
+    sm = r"Microsoft\Windows\Start Menu\Programs"
+    dirs = [os.path.join(up, "Desktop"), os.path.join(pub, "Desktop"),
+            os.path.join(up, "AppData", "Roaming", sm), os.path.join(dat, sm)]
+    dirs = [d for d in dirs if d and os.path.isdir(d)]
+    if not dirs:
+        return out
+    script = ("$sh=New-Object -ComObject WScript.Shell;"
+              "foreach($d in @(%s)){ Get-ChildItem -LiteralPath $d -Filter *.lnk "
+              "-Recurse -Depth 1 -ErrorAction SilentlyContinue | ForEach-Object {"
+              " $t=$sh.CreateShortcut($_.FullName).TargetPath;"
+              " if($t -and -not (Test-Path -LiteralPath $t)){"
+              " '{0}|||{1}' -f $_.FullName,$t } } }"
+              % ",".join("'%s'" % d.replace("'", "''") for d in dirs))
+    try:
+        rc, o = ps(script, timeout=90)
+    except Exception:
+        return out
+    for line in (o or "").splitlines():
+        line = line.strip()
+        if "|||" not in line:
+            continue
+        lnk, _target = line.split("|||", 1)
+        lnk = lnk.strip()
+        if lnk and os.path.exists(lnk):
+            out.append({"path": lnk, "kind": "file", "bytes": 0,
+                        "tag": "失效快捷方式"})
+            if len(out) >= cap:
+                break
+    return out
+
+
+def orphan_scan(cap=120):
+    """全机卸载残留扫描（不需要选中程序）。
+
+    返回结构与 residual_scan 相同（files / reg），可直接交给残留清理对话框 ——
+    删除沿用同一套安全白名单与注册表分类规则。
+    高置信项（孤儿卸载项 / 启动项 / 服务 / 失效快捷方式）排在前，
+    低置信项（疑似残留目录）标 weak 由用户确认。
+    """
+    claimed, toks, inst = orphan_index()
+    files, regs = [], []
+    regs += _orphan_entries(inst, cap)
+    regs += _orphan_startup(cap)
+    regs += _orphan_services(cap)
+    files += _broken_shortcuts(cap)
+    files += _orphan_dirs(claimed, toks, cap)
+    for f in files:                   # 统一数据契约：每项都显式带 weak
+        f.setdefault("weak", False)
+    return {"files": files[:cap], "reg": regs[:cap], "tokens": []}
 
 
 def _exe_from_path(cmd):
@@ -1327,14 +2924,113 @@ def _dns_raw_query(ip, domain="www.baidu.com", timeout=2.5):
                 pass
 
 
-def _dns_probe(ip, domain, timeout=1.5, measured=3):
-    """单个 DNS 的真实延迟探测（参照 DnsTools / trust-dns-resolver 的做法）。
+# --------------------------------------------------------------------------
+# ICMP ping —— 与 DnsTools 一致的测速口径
+#
+# DnsTools 用 ping 测 DNS 延迟。这里直接调原生 ICMP（iphlpapi!IcmpSendEcho），
+# 而不是起 `ping.exe` 进程：对上百台服务器测速时，进程创建开销会让整体慢到不可用
+# （每台 0.5~2s）。原生 ICMP 单次往返只需毫秒级，普通用户即可发送，无需管理员。
+# --------------------------------------------------------------------------
+_ICMP = {"ready": False}
 
-    关键：热门域名（如 www.baidu.com）会被运营商缓存/透明拦截秒回，
-    测出来的 2ms 是假延迟。这里改为：
-      1. 正常域名查询一次 —— 验证服务器可用、拿到解析结果（同时当预热）；
-      2. 再用「随机子域名」查询 N 次 —— 任何真实解析器都必须向上游递归，
-         拿到的才是该服务器与根/权威链路的真实往返耗时；取最小值。
+
+def _icmp_init():
+    """惰性初始化 ctypes 签名。不设 argtypes 在 64 位下会指针截断而崩溃。"""
+    if _ICMP.get("ready"):
+        return _ICMP
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+
+        class IPO(ctypes.Structure):
+            _fields_ = [("Ttl", ctypes.c_ubyte), ("Tos", ctypes.c_ubyte),
+                        ("Flags", ctypes.c_ubyte), ("OptionsSize", ctypes.c_ubyte),
+                        ("OptionsData", ctypes.c_void_p)]
+
+        class REPLY(ctypes.Structure):
+            _fields_ = [("Address", wt.ULONG), ("Status", wt.ULONG),
+                        ("RoundTripTime", wt.ULONG), ("DataSize", wt.USHORT),
+                        ("Reserved", wt.USHORT), ("Data", ctypes.c_void_p),
+                        ("Options", IPO)]
+
+        ip = ctypes.windll.iphlpapi
+        ip.IcmpCreateFile.restype = ctypes.c_void_p
+        ip.IcmpSendEcho.argtypes = [ctypes.c_void_p, wt.ULONG, ctypes.c_void_p,
+                                    wt.USHORT, ctypes.c_void_p, ctypes.c_void_p,
+                                    wt.DWORD, wt.DWORD]
+        ip.IcmpSendEcho.restype = wt.DWORD
+        ip.IcmpCloseHandle.argtypes = [ctypes.c_void_p]
+        ws = ctypes.windll.ws2_32
+        ws.inet_addr.argtypes = [ctypes.c_char_p]
+        ws.inet_addr.restype = wt.ULONG
+        _ICMP.update(ready=True, ctypes=ctypes, ip=ip, ws=ws, REPLY=REPLY)
+    except Exception:
+        _ICMP["ready"] = False
+    return _ICMP
+
+
+def _icmp_ping_v4(ip_str, timeout_ms=1000, tries=2):
+    """IPv4 ICMP Echo，返回最小往返毫秒（int）；不通返回 None。"""
+    st = _icmp_init()
+    if not st.get("ready"):
+        return None
+    try:
+        ctypes = st["ctypes"]
+        dst = st["ws"].inet_addr(ip_str.encode("ascii"))
+        if dst == 0xFFFFFFFF:                 # INADDR_NONE：不是合法 IPv4
+            return None
+        h = st["ip"].IcmpCreateFile()
+        if not h or h == ctypes.c_void_p(-1).value:
+            return None
+        try:
+            payload = b"WinToolboxPing01" * 3             # 45 字节
+            rsz = ctypes.sizeof(st["REPLY"]) + len(payload) + 8
+            buf = ctypes.create_string_buffer(rsz)
+            best = None
+            for _ in range(max(1, tries)):
+                n = st["ip"].IcmpSendEcho(h, dst, payload, len(payload), None,
+                                          buf, rsz, timeout_ms)
+                if not n:
+                    break                     # 超时：本次无应答
+                rep = ctypes.cast(buf, ctypes.POINTER(st["REPLY"])).contents
+                if rep.Status == 0:           # IP_SUCCESS
+                    ms = float(rep.RoundTripTime)
+                    if best is None or ms < best:
+                        best = ms
+            return int(round(best)) if best is not None else None
+        finally:
+            st["ip"].IcmpCloseHandle(h)
+    except Exception:
+        return None
+
+
+def ping_ms(ip_str, timeout_ms=1000, tries=2):
+    """DNS 测速的延迟口径：IPv4 走原生 ICMP；IPv6 退回系统 `ping -6` 一次。"""
+    ip_str = (ip_str or "").strip()
+    if not ip_str:
+        return None
+    if ":" in ip_str:                          # IPv6：原生路径不支持，退回 ping.exe
+        try:
+            r = ping_host(ip_str, count=1)
+            return int(r["avg"]) if r.get("ok") and r.get("avg") is not None else None
+        except Exception:
+            return None
+    return _icmp_ping_v4(ip_str, timeout_ms, tries)
+
+
+def _dns_probe(ip, domain, timeout=1.5, measured=3, comm=False):
+    """单个 DNS 的延迟探测（参照 DnsTools / trust-dns-resolver 的做法）。
+
+    comm=False（默认）—— **解析延迟**：
+      热门域名（如 www.baidu.com）会被运营商缓存/透明拦截秒回，测出的 2ms 是假延迟。
+      故 1) 正常查一次拿解析结果（兼预热）；2) 再用「随机子域名」查 N 次 ——
+      任何真实解析器都必须向上游递归，拿到的才是该服务器与根/权威链路的真实耗时；取最小。
+
+    comm=True —— **通信延迟（本机 ↔ 该 DNS 服务器）**：
+      只发普通域名查询（服务器有缓存就直接应答），取多次往返的最小值。
+      不含服务器向上游递归的时间，反映的就是本机到这台服务器之间的链路快慢，
+      用来回答「换哪个 DNS 对本机更快」。
+
     全程复用同一个已连接 socket（trust-dns 同款做法），排除建连开销。
     """
     fam = socket.AF_INET6 if ":" in ip else socket.AF_INET
@@ -1345,48 +3041,68 @@ def _dns_probe(ip, domain, timeout=1.5, measured=3):
     except Exception:
         return {"ok": False, "ms": None, "answer": None}
 
+    import time as _t
+
     def q(name):
+        """发一次查询，返回 (data, ms)；失败返回 (None, None)。"""
         try:
             qname = b"".join(bytes([len(label)]) + label.encode("utf-8")
                              for label in name.split(".")) + b"\x00"
             req = struct.pack(">HHHHHH", random.randint(0, 0xFFFF), 0x0100,
                               1, 0, 0, 0) + qname + struct.pack(">HH", 1, 1)
+            t0 = _t.perf_counter()
             sock.send(req)
             data, _ = sock.recvfrom(512)
-            ms = None
-            return data
+            return data, (_t.perf_counter() - t0) * 1000.0
         except Exception:
-            return None
+            return None, None
 
-    import time as _t
-    answer = None
-    # 1) 正常查询：验证可用 + 解析结果 + 预热
-    data = q(domain)
-    if data is not None:
+    def parse(data):
         try:
             flags = struct.unpack_from(">H", data, 2)[0]
             ancount = struct.unpack_from(">H", data, 6)[0]
             if (flags & 0x0F) == 0 and ancount > 0:
-                answer = _dns_parse_answer(data, domain)
+                return _dns_parse_answer(data, domain)
         except Exception:
             pass
-    # 2) 随机子域名强制递归，测真实往返
+        return None
+
+    answer = None
+    # 1) 普通域名查询：验证可用 + 解析结果；comm 模式下它本身就是最终结果
+    comm_best = None
+    rounds = max(1, measured) if comm else 1
+    for _ in range(rounds):
+        data, ms = q(domain)
+        if data is not None:
+            if answer is None:
+                answer = parse(data)
+            if ms is not None and (comm_best is None or ms < comm_best):
+                comm_best = ms
+    if comm:
+        try:
+            sock.close()
+        except Exception:
+            pass
+        return {"ok": comm_best is not None,
+                "ms": int(round(comm_best)) if comm_best is not None else None,
+                "answer": answer}
+
+    # 2) 随机子域名强制递归，测真实解析往返
     best = None
+    last = None
     for _ in range(measured):
         rnd = "%012x.%s" % (random.getrandbits(48), domain)
-        t0 = _t.perf_counter()
-        data = q(rnd)
-        if data is not None:
-            ms = (_t.perf_counter() - t0) * 1000.0
-            if best is None or ms < best:
-                best = ms
+        data, ms = q(rnd)
+        last = data
+        if data is not None and ms is not None and (best is None or ms < best):
+            best = ms
     try:
         sock.close()
     except Exception:
         pass
-    if best is not None:
-        best = int(round(best))
-    return {"ok": data is not None, "ms": best, "answer": answer}
+    return {"ok": last is not None,
+            "ms": int(round(best)) if best is not None else None,
+            "answer": answer}
 
 
 def _dns_parse_answer(data, domain):
@@ -1430,33 +3146,151 @@ def _dns_parse_answer(data, domain):
     return None
 
 
-def dns_test(mode="mixed", domain="www.baidu.com"):
-    """mode: domestic / foreign / mixed / ipv6. Returns list of {name, ip, cat, ok, ms, answer}."""
+def local_dns_servers():
+    """枚举本机当前生效的 DNS 服务器（取自已启用网卡的配置），用于「本机 DNS 测速」。
+
+    纯依赖 ``ipconfig /all``，无需第三方库，Windows 专用。返回
+    ``[{"name": "本机 · <适配器名>", "ip": "<DNS IP>"}, ...]``（已去重，
+    仅包含已启用网卡）。若取不到（无网络 / 命令失败）返回空列表。
+
+    做法参照 DnsTools 的「本机 DNS」思路：拿到本机真正在用的 DNS 服务器后再逐个测速，
+    而不是只测内置公共 DNS 列表。
+    """
+    import subprocess
+    import re
+    try:
+        out = subprocess.run(
+            ["ipconfig", "/all"],
+            capture_output=True, text=True,
+            encoding="gbk", errors="ignore",
+            creationflags=0x08000000,   # CREATE_NO_WINDOW：隐藏黑窗口
+        ).stdout
+    except Exception:
+        return []
+    if not out:
+        return []
+
+    ip_re = re.compile(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b")
+    servers = []
+    seen = set()
+    cur_name = None
+    cur_active = True
+    in_dns = False
+
+    def add(ip):
+        if not cur_active or ip in seen:
+            return
+        seen.add(ip)
+        label = "本机 · " + (cur_name or "未知网卡")
+        servers.append({"name": label, "ip": ip})
+
+    for raw in out.splitlines():
+        line = raw.rstrip()
+        if not line.strip():
+            continue
+        indented = line[:1] in (" ", "\t")
+        stripped = line.strip()
+        low = stripped.lower()
+        # 适配器标题（行首无缩进、含「适配器」/「adapter」、以冒号结尾）
+        if (not indented) and ("适配器" in stripped or "adapter" in low) and stripped.endswith(":"):
+            cur_name = stripped[:-1].strip()
+            cur_active = True
+            in_dns = False
+            continue
+        # 媒体已断开 → 该适配器视为未启用
+        if "媒体已断开" in stripped or "media disconnected" in low:
+            cur_active = False
+        # DNS 服务器行（带标签的那一行，可能本身已含 1 个 IP）
+        if ("DNS 服务器" in stripped) or ("DNS Servers" in stripped):
+            in_dns = True
+            for ip in ip_re.findall(stripped):
+                add(ip)
+            continue
+        # DNS 多行延续（缩进、无冒号标签、含 IP）—— ipconfig 会把多个 DNS 折行列出
+        if in_dns and indented and (":" not in stripped):
+            ips = ip_re.findall(stripped)
+            if ips:
+                for ip in ips:
+                    add(ip)
+            else:
+                in_dns = False
+            continue
+        # 遇到下一个带冒号的属性，结束 DNS 延续区
+        if in_dns and (":" in stripped):
+            in_dns = False
+    return servers
+
+
+def dns_test(mode="mixed", domain="www.baidu.com", on_each=None):
+    """mode: domestic / foreign / mixed / ipv6 / local.
+    Returns list of {name, ip, cat, ok, ms, answer, dns_ok}.
+
+    **延迟口径 = ICMP ping**（与 DnsTools 一致）：`ms` 是 ping 往返毫秒，`ok` 表示 ping 通。
+    每台还会做一次 DNS 查询拿 `answer`（解析结果），并把能否解析记为 `dns_ok` —— 这样
+    「禁 ping 但能解析」（如 114.114.114.114）的服务器能被区分出来，而不是直接判不可用。
+
+    mode=="local"（本机 DNS 测速）：服务器集 = 本机网卡当前配置的 DNS（分类「本机在用」）
+    + 内置公共 DNS（国内/国外）；本机没配 DNS 时该部分为空，但仍会测公共 DNS。
+
+    `on_each` — 可选回调。每测完**一台**服务器就立刻调用一次（传入该台的结果 dict），
+    供界面边测边显示，不必等全部跑完。注意：回调在**线程池的工作线程**里触发，
+    实现必须是线程安全的（通常只是往 queue.Queue 里 put），不要直接碰 Qt 控件。
+    回调抛异常会被忽略，不影响整体结果。
+    """
     if mode == "domestic":
         src = [(s, "国内") for s in DNS_SERVERS["domestic"]]
     elif mode == "foreign":
         src = [(s, "国外") for s in DNS_SERVERS["foreign"]]
     elif mode == "ipv6":
         src = [(s, "IPv6") for s in DNS_V6_SERVERS]
+    elif mode == "local":
+        # 本机 DNS 测速 = 本机 ↔ 各 DNS 服务器的「通信延迟」。
+        # 对象：本机网卡当前配置的 DNS（标「本机在用」，便于对比"现在用的排第几"）
+        #       + 内置公共 DNS（国内 / 国外）。度量走 comm=True（不含向上游递归）。
+        src = [(s, "本机在用") for s in local_dns_servers()] + \
+              [(s, "国内") for s in DNS_SERVERS["domestic"]] + \
+              [(s, "国外") for s in DNS_SERVERS["foreign"]]
     else:
         src = [(s, "国内") for s in DNS_SERVERS["domestic"]] + \
               [(s, "国外") for s in DNS_SERVERS["foreign"]]
     out = [None] * len(src)
+    # 统一成 (序号, 服务器, 分类) 三元组：并行与串行兜底共用同一入参形态，
+    # 避免「嵌套拆包」写错导致并行分支静默退化为串行。
+    jobs = [(i, s, cat) for i, (s, cat) in enumerate(src)]
 
-    def work(i_s_cat):
-        i, s, cat = i_s_cat
-        r = _dns_probe(s["ip"], domain)
-        r.update({"name": s["name"], "ip": s["ip"], "cat": cat})
+    def work(job):
+        i, s, cat = job
+        ip = s["ip"]
+        # 延迟口径 = **ICMP ping**（对齐 DnsTools）；同时做一次 DNS 查询拿解析结果，
+        # 于是「禁 ping 但能解析」的服务器（如 114）也能被正确标注，不会被误判为不可用。
+        ms = ping_ms(ip)
+        d = _dns_probe(ip, domain, comm=True)
+        r = {"name": s["name"], "ip": ip, "cat": cat,
+             "ok": ms is not None, "ms": ms,
+             "answer": d.get("answer"), "dns_ok": bool(d.get("ok"))}
+        if on_each is not None:
+            try:
+                on_each(r)
+            except Exception:
+                pass          # 推送失败（如界面已关闭）不影响测试本身
         return i, r
 
-    # 并行探测：122 个 DNS 串行要跑一分多钟，16 线程十几秒出全量结果
+    # 并行探测：114 个国内 DNS 串行要跑几十秒到几分钟（大量服务器不可达时每次
+    # 都要等满超时）。单次探测是「独立 UDP socket + 阻塞收发」，无线程共享状态、
+    # 纯 IO 等待 —— 提高并发只增加文件描述符占用，无数据竞争。
     try:
         from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=16) as ex:
-            for i, r in ex.map(work, list(enumerate(src))):
+        with ThreadPoolExecutor(max_workers=32) as ex:
+            for i, r in ex.map(work, jobs):
                 out[i] = r
+    except (ValueError, TypeError, AttributeError):
+        # 这几类是**代码 bug**（拆包形态不匹配、字段缺失…），不是环境问题。
+        # 一律上抛：绝不静默降级成串行掩盖过去 —— 旧实现就是在这里无声退化成
+        # 串行，让「并行从未生效」被当成「只是有点慢」藏了很久。
+        raise
     except Exception:
-        out = [work((i, s, cat))[1] for i, (s, cat) in enumerate(src)]
+        # 仅环境类问题（线程/句柄不足等）才退化为串行，且入参形态与并行一致
+        out = [work(j)[1] for j in jobs]
     out = [r for r in out if r]
     out.sort(key=lambda x: (not x["ok"], x["ms"] if x["ms"] is not None else 9999))
     return out
@@ -1788,87 +3622,6 @@ def policies_fix(paths):
 
 
 # --------------------------------------------------------------------------
-# infected-PE scanner (Synaptics / XRed)
-# --------------------------------------------------------------------------
-import struct
-
-
-def pe_sections(data):
-    if len(data) < 0x100 or data[:2] != b"MZ":
-        return None
-    try:
-        e = struct.unpack_from("<I", data, 0x3C)[0]
-        if data[e:e + 4] != b"PE\0\0":
-            return None
-        nsec = struct.unpack_from("<H", data, e + 6)[0]
-        optsize = struct.unpack_from("<H", data, e + 20)[0]
-        sec_off = e + 24 + optsize
-        secs = []
-        for i in range(nsec):
-            o = sec_off + i * 40
-            nm = data[o:o + 8].rstrip(b"\0").decode("latin1", "replace")
-            vs, va, rs, rp = struct.unpack_from("<IIII", data, o + 8)
-            secs.append((nm, rs, rp))
-        return secs
-    except Exception:
-        return None
-
-
-INFECT_STRINGS = [b"xred.mooo.com", b"Synaptics2X", b"site50", b"SSLLibrary.dll",
-                  b"KBHks.dll", b"USBHOOK", b"AUTORUNINJ"]
-
-
-def scan_path_for_infection(path, max_files=4000, deep=False):
-    hits = []
-    scanned = 0
-    for dp, dn, fn in os.walk(path):
-        for f in fn:
-            if scanned >= max_files:
-                break
-            full = os.path.join(dp, f)
-            try:
-                size = os.path.getsize(full)
-            except OSError:
-                continue
-            if size < 4096 or size > 400 * 1024 * 1024:
-                continue
-            if not full.lower().endswith((".exe", ".dll", ".sys", ".ocx", ".scr", ".cpl")):
-                continue
-            try:
-                with open(full, "rb") as fh:
-                    head = fh.read(0x1000)
-                    secs = pe_sections(head)
-                    if not secs:
-                        continue
-                    scanned += 1
-                    verdict = None
-                    code = [s for s in secs if s[0] == "CODE"]
-                    if code and code[0][1] == 629760:
-                        nm, rs, rp = code[0]
-                        fh.seek(rp)
-                        blob = fh.read(rs)
-                        if hex_md5(blob) == LOADER_CODE_MD5:
-                            verdict = "infected-loader"
-                        else:
-                            fh.seek(0)
-                            chunk = fh.read(2 * 1024 * 1024)
-                            if any(s in chunk for s in INFECT_STRINGS):
-                                verdict = "suspicious"
-                    if verdict is None and deep:
-                        fh.seek(0)
-                        chunk = fh.read(3 * 1024 * 1024)
-                        if any(s in chunk for s in INFECT_STRINGS):
-                            verdict = "suspicious"
-                    if verdict:
-                        hits.append({"path": full, "size": size, "verdict": verdict})
-            except Exception:
-                continue
-        if scanned >= max_files:
-            break
-    return {"base": path, "scanned": scanned, "hits": hits}
-
-
-# --------------------------------------------------------------------------
 # GPU / disk / temperature
 # --------------------------------------------------------------------------
 def _nvidia_smi():
@@ -1899,16 +3652,17 @@ def _nvidia_smi():
 # nvidia-smi 明细 1 秒缓存：概览页每秒刷新时复用，避免重复起进程
 _NV_CACHE = {"t": 0.0, "v": None}
 # TTL 略大于后台采样间隔（1s），避免刷新任务正好撞上缓存过期的瞬间而自己又读一次
-_NV_TTL = 1.8
+_NV_TTL = 4.0
 
 
 def _nvidia_smi_cached():
-    now = time.time()
-    if _NV_CACHE["v"] is not None and now - _NV_CACHE["t"] < _NV_TTL:
-        return _NV_CACHE["v"]
-    v = _nvidia_smi()
-    _NV_CACHE.update(t=now, v=v)
-    return v
+    with _NV_LOCK:
+        now = time.time()
+        if _NV_CACHE["v"] is not None and now - _NV_CACHE["t"] < _NV_TTL:
+            return _NV_CACHE["v"]
+        v = _nvidia_smi()
+        _NV_CACHE.update(t=now, v=v)
+        return v
 
 
 # --------------------------------------------------------------------------
@@ -2137,6 +3891,239 @@ def cpu_set_plan(guid):
     return {"ok": rc == 0, "err": (out or "").strip()[:120]}
 
 
+# --------------------------------------------------------------------------
+# 电源计划：内置模板 / 本机 .pow 扫描 / 导入并回读验证
+#
+# 对标 LaoYing Toolkit 的电源计划面板，但只做「启用 + 导入 + 回读验证」：
+#   * 内置模板 —— 高性能直接启用；卓越性能在多数机器上是隐藏模板，
+#     先 `-duplicatescheme` 复制一份再启用（Windows 官方模板，非第三方文件）。
+#   * .pow 导入 —— 交给 Windows 自己 `-import`，随后**回读**计划列表，
+#     确认新 GUID 真的被系统列出，避免"命令返回 0 但其实没导入"。
+# --------------------------------------------------------------------------
+POWER_TEMPLATES = {
+    "high":     ("高性能",   "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"),
+    "ultimate": ("卓越性能", "e9a42b02-d5df-448d-aa00-03f14749eb61"),
+    "balanced": ("平衡",     "381b4222-f694-41f0-9685-ff5bb260df2e"),
+    "saver":    ("节能",     "a1841308-3541-4fab-bc81-f71556f20b4a"),
+}
+_GUID_RE = re.compile(r"([0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12})")
+
+
+def power_plan_activate_template(kind="high"):
+    """启用内置电源模板（high / ultimate / balanced / saver）。返回 {ok,msg,guid,name}。
+
+    顺序：已有同名计划 → 直接启用；系统直接认得该 GUID → 启用；
+    否则当隐藏模板处理，复制一份再启用（卓越性能走这条）。
+    """
+    tpl = POWER_TEMPLATES.get(kind)
+    if not tpl:
+        return {"ok": False, "msg": "未知的电源计划模板：%s" % kind}
+    label, guid = tpl
+    for p in cpu_plans():                       # 1) 同名计划已存在（可能是之前复制出来的）
+        if (p.get("name") or "").strip() == label:
+            r = cpu_set_plan(p["guid"])
+            return {"ok": bool(r.get("ok")), "guid": p["guid"],
+                    "name": p.get("name") or label,
+                    "msg": ("已启用「%s」。" % (p.get("name") or label)) if r.get("ok")
+                           else "启用失败：%s" % r.get("err")}
+    rc, out = run(["powercfg", "/setactive", guid], timeout=30)
+    if rc == 0:                                 # 2) 系统直接认得该模板
+        return {"ok": True, "guid": guid, "name": label,
+                "msg": "已启用「%s」。" % label}
+    rc2, out2 = run(["powercfg", "-duplicatescheme", guid], timeout=30)
+    m = _GUID_RE.search(out2 or "")
+    if rc2 != 0 or not m:                       # 3) 隐藏模板：复制后再启用
+        return {"ok": False, "msg": "系统未提供该电源模板，无法启用：%s"
+                % ((out2 or out or "").strip()[:140] or "powercfg 无输出")}
+    new_guid = m.group(1)
+    r = cpu_set_plan(new_guid)
+    return {"ok": bool(r.get("ok")), "guid": new_guid, "name": label,
+            "msg": ("已创建并启用「%s」。" % label) if r.get("ok")
+                   else "已复制该模板但启用失败：%s" % r.get("err")}
+
+
+def power_plan_delete(guid):
+    """删除一个电源计划（当前正在使用的不能删）。"""
+    if not _is_guid(guid):
+        return {"ok": False, "msg": "无效的电源计划 ID"}
+    act = next((p for p in cpu_plans() if p.get("active")), None)
+    if act and act["guid"].lower() == guid.lower():
+        return {"ok": False, "msg": "不能删除当前正在使用的电源计划"}
+    rc, out = run(["powercfg", "-delete", guid], timeout=30)
+    return {"ok": rc == 0,
+            "msg": "已删除该电源计划" if rc == 0 else
+                   "删除失败：%s" % ((out or "").strip()[:140] or "未知原因")}
+
+
+# --- 本机 .pow 扫描 ------------------------------------------------------
+_POW_MAX_FILES = 400
+_POW_MAX_DEPTH = 2          # 每个扫描根最多下探两层，避免全盘遍历拖慢界面
+
+# KNOWNFOLDERID —— 走 Shell API 取「真实」用户目录：
+# 很多机器把桌面/下载重定向到别的盘（D:\桌面 之类），
+# 直接拼 %USERPROFILE%\Desktop 会扫不到，所以这里必须问系统。
+_KNOWN_FOLDERS = {
+    "Desktop":   "B4BFCC3A-DB2C-424C-B029-7FE99A87C641",
+    "Downloads": "374DE290-123F-4565-9164-39C4925E467B",
+    "Documents": "FDD39AD0-238F-46AF-ADB4-6C85480369C7",
+}
+
+
+class _GUID(ctypes.Structure):
+    _fields_ = [("Data1", ctypes.c_ulong), ("Data2", ctypes.c_ushort),
+                ("Data3", ctypes.c_ushort), ("Data4", ctypes.c_ubyte * 8)]
+
+
+def _guid_from_str(s):
+    parts = s.strip("{}").split("-")
+    g = _GUID()
+    g.Data1 = int(parts[0], 16)
+    g.Data2 = int(parts[1], 16)
+    g.Data3 = int(parts[2], 16)
+    for i, b in enumerate(bytes.fromhex(parts[3] + parts[4])):
+        g.Data4[i] = b
+    return g
+
+
+def known_folder(name):
+    """取真实用户目录（含被重定向到其它盘的桌面 / 下载 / 文档）。失败返回 ""。"""
+    gid = _KNOWN_FOLDERS.get(name)
+    if not gid or os.name != "nt":
+        return ""
+    try:
+        g = _guid_from_str(gid)
+        out = ctypes.c_wchar_p()
+        hr = ctypes.windll.shell32.SHGetKnownFolderPath(
+            ctypes.byref(g), 0, None, ctypes.byref(out))
+        if hr != 0 or not out.value:
+            return ""
+        path = out.value
+        ctypes.windll.ole32.CoTaskMemFree(out)
+        return path
+    except Exception:
+        return ""
+
+
+def power_plan_scan_dirs():
+    """本机常见的 .pow 存放位置（存在才返回，去重）。"""
+    home = os.path.expanduser("~")
+    cands = []
+    for nm in ("Desktop", "Downloads", "Documents"):
+        p = known_folder(nm)
+        if p:
+            cands.append(p)
+        cands.append(os.path.join(home, nm))          # 未重定向时的常规位置
+    cands += [APP_DIR, os.path.join(APP_DIR, "tools"),
+              os.path.join(APP_DIR, "assets"), os.path.join(APP_DIR, "data")]
+    out = []
+    for c in cands:
+        if not c:
+            continue
+        try:
+            c = os.path.abspath(c)
+        except Exception:
+            continue
+        if os.path.isdir(c) and c not in out:
+            out.append(c)
+    return out
+
+
+def power_plan_scan_pow(extra_dirs=None):
+    """扫描本机 .pow 文件 → [{name,file,path,dir,size,mtime}]（按修改时间降序）。"""
+    roots = []
+    for d in list(extra_dirs or []) + power_plan_scan_dirs():
+        if d and os.path.isdir(d) and d not in roots:
+            roots.append(d)
+    seen, out = set(), []
+    for root in roots:
+        base_depth = os.path.abspath(root).rstrip("\\/").count(os.sep)
+        for dp, dns, fns in os.walk(root):
+            if dp.rstrip("\\/").count(os.sep) - base_depth >= _POW_MAX_DEPTH:
+                dns[:] = []
+            else:
+                dns[:] = [d for d in dns if not d.startswith(".")]
+            for f in fns:
+                if not f.lower().endswith(".pow"):
+                    continue
+                p = os.path.join(dp, f)
+                k = p.lower()
+                if k in seen:
+                    continue
+                seen.add(k)
+                try:
+                    st = os.stat(p)
+                    size, mt = st.st_size, st.st_mtime
+                except OSError:
+                    size, mt = 0, 0.0
+                out.append({"name": os.path.splitext(f)[0], "file": f,
+                            "path": p, "dir": dp, "size": size, "mtime": mt})
+                if len(out) >= _POW_MAX_FILES:
+                    break
+            if len(out) >= _POW_MAX_FILES:
+                break
+    out.sort(key=lambda x: (-(x["mtime"] or 0), x["name"].lower()))
+    return out
+
+
+def power_plan_candidates(extra_dirs=None):
+    """候选清单 = 已安装计划 + 本机 .pow 文件。
+
+    items: [{kind:"plan"|"pow", name, source, guid, path, active}]
+      kind=plan —— 系统里已安装的计划，source="已安装"
+      kind=pow  —— 本机扫到的 .pow 文件，source="本机文件"
+    """
+    items = []
+    plans = cpu_plans()
+    for p in plans:
+        items.append({"kind": "plan", "name": p.get("name") or p.get("guid"),
+                      "source": "已安装", "guid": p.get("guid") or "",
+                      "path": "", "active": bool(p.get("active"))})
+    files = power_plan_scan_pow(extra_dirs)
+    for f in files:
+        items.append({"kind": "pow", "name": f["name"], "source": "本机文件",
+                      "guid": "", "path": f["path"], "active": False})
+    return {"items": items, "files": files,
+            "pow_count": len(files), "plan_count": len(plans)}
+
+
+def power_plan_import_pow(path, activate=True):
+    """导入 .pow 电源计划：Windows 导入 → 回读验证 → 可选立即启用。
+
+    回读验证：导入后重新枚举计划列表，必须能读回同一个 GUID，
+    否则视为失败（命令行返回 0 但实际未导入的情况会被这一步拦住）。
+    """
+    p = (path or "").strip().strip('"')
+    if not p:
+        return {"ok": False, "msg": "请先选择一个 .pow 文件"}
+    if os.path.splitext(p)[1].lower() != ".pow":
+        return {"ok": False, "msg": "只支持 .pow 电源计划文件"}
+    if not os.path.isfile(p):
+        return {"ok": False, "msg": "文件不存在：%s" % p}
+    rc, out = run(["powercfg", "-import", p], timeout=60)
+    m = _GUID_RE.search(out or "")
+    if rc != 0 or not m:
+        return {"ok": False, "guid": "",
+                "msg": "导入失败：%s" % ((out or "").strip()[:150]
+                                       or "powercfg 未返回方案 GUID")}
+    guid = m.group(1)
+    rec = next((x for x in cpu_plans()
+                if (x.get("guid") or "").lower() == guid.lower()), None)
+    if rec is None:
+        return {"ok": False, "guid": guid,
+                "msg": "导入后回读验证失败：系统未列出该计划（可能被系统拒绝）"}
+    name = rec.get("name") or guid
+    res = {"ok": True, "guid": guid, "name": name, "active": False,
+           "msg": "已导入并回读验证：%s" % name}
+    if activate:
+        r = cpu_set_plan(guid)
+        if r.get("ok"):
+            res["active"] = True
+            res["msg"] = "已导入并启用：%s" % name
+        else:
+            res["msg"] = "已导入（回读验证通过），但启用失败：%s" % r.get("err")
+    return res
+
+
 # 隐藏的 Speed Shift EPP 阈值（0=最高性能，100=最高能效）
 _EPP_GUID = "36687f9e-e3a5-4dbf-b1dc-15eb381c6863"
 _PROC_SUB = "SUB_PROCESSOR"
@@ -2323,6 +4310,408 @@ def ecore_restore():
     rc, out = run(["bcdedit", "/deletevalue", "{current}", "numproc"], timeout=30)
     ok = rc == 0
     return {"ok": ok, "err": "" if ok else (out or "").strip()[:120]}
+
+
+# --------------------------------------------------------------------------
+# 核心调度增强（对标 LaoYing Toolkit 的 Scheduler / MemoryPriority / 核心预留）
+#
+# 与既有 `set_process_affinity`（只能整组绑 P / E / 全部）的区别：
+#   · 可选**任意核心集合**，并支持「强亲和」—— 同时贯穿该进程的**所有线程**
+#   · 设置**内存优先级 / IO 优先级**
+#   · **释放工作集**（单进程 / 全系统）
+#   · 读回当前调度状态（亲和掩码 + 优先级类 + 内存优先级）
+# 全部是可打桩纯函数：测试里替换掉即不会真改系统。
+# --------------------------------------------------------------------------
+_PROCESS_SET_INFORMATION = 0x0200
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_THREAD_SET_INFORMATION = 0x0020
+_THREAD_QUERY_INFORMATION = 0x0040
+_TH32CS_SNAPTHREAD = 0x00000004
+
+MEM_PRIORITY_NAMES = {0: "很低", 1: "低", 2: "普通", 3: "中", 4: "高", 5: "很高"}
+IO_PRIORITY_NAMES = {0: "很低", 1: "低", 2: "普通", 3: "高", 4: "很高"}
+PRIORITY_CLASS_NAMES = {
+    0x00000040: "空闲", 0x00004000: "低于普通", 0x00000020: "普通",
+    0x00008000: "高于普通", 0x00000080: "高", 0x00000100: "实时",
+}
+
+
+def _open_process(pid, access=None):
+    k32 = _k32
+    acc = access if access is not None else (_PROCESS_SET_INFORMATION |
+                                             _PROCESS_QUERY_LIMITED_INFORMATION)
+    return k32, k32.OpenProcess(acc, False, int(pid))
+
+
+def cores_to_mask(cores):
+    """逻辑核号列表 → 亲和掩码（最多 64 位）。"""
+    mask = 0
+    for c in cores or []:
+        try:
+            c = int(c)
+        except Exception:
+            continue
+        if 0 <= c < 64:
+            mask |= (1 << c)
+    return mask
+
+
+def _thread_ids(pid):
+    """枚举某进程的所有线程 ID（CreateToolhelp32Snapshot）。"""
+    class THREADENTRY32(ctypes.Structure):
+        _fields_ = [("dwSize", wt.DWORD), ("cntUsage", wt.DWORD),
+                    ("th32ThreadID", wt.DWORD), ("th32OwnerProcessID", wt.DWORD),
+                    ("tpBasePri", wt.LONG), ("tpDeltaPri", wt.LONG),
+                    ("dwFlags", wt.DWORD)]
+
+    k32 = _k32
+    k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    snap = k32.CreateToolhelp32Snapshot(_TH32CS_SNAPTHREAD, 0)
+    if not snap or snap == ctypes.c_void_p(-1).value:
+        return []
+    out = []
+    try:
+        te = THREADENTRY32()
+        te.dwSize = ctypes.sizeof(THREADENTRY32)
+        ok = k32.Thread32First(ctypes.c_void_p(snap), ctypes.byref(te))
+        while ok:
+            if int(te.th32OwnerProcessID) == int(pid):
+                out.append(int(te.th32ThreadID))
+            ok = k32.Thread32Next(ctypes.c_void_p(snap), ctypes.byref(te))
+    except Exception:
+        pass
+    finally:
+        k32.CloseHandle(ctypes.c_void_p(snap))
+    return out
+
+
+def set_process_affinity_cores(pid, cores, strong=False):
+    """把进程绑定到**指定核心集合**（逻辑核号从 0 起）。
+
+    strong=True 时还会遍历该进程的所有线程逐个 `SetThreadAffinityMask` ——
+    即 LaoYing 的 "Strong affinity"，用于「进程设了但某些线程不听话」的场景。
+    """
+    mask = cores_to_mask(cores)
+    if mask == 0:
+        return {"ok": False, "err": "请至少选择一个核心"}
+    k32, h = _open_process(pid)
+    if not h:
+        return {"ok": False, "err": "OpenProcess 失败（权限不足或系统进程）"}
+    try:
+        if not k32.SetProcessAffinityMask(ctypes.c_void_p(h), ctypes.c_size_t(mask)):
+            return {"ok": False, "err": "SetProcessAffinityMask 失败"}
+        threads = failed = 0
+        if strong:
+            for tid in _thread_ids(pid):
+                th = k32.OpenThread(_THREAD_SET_INFORMATION | _THREAD_QUERY_INFORMATION,
+                                    False, tid)
+                if not th:
+                    failed += 1
+                    continue
+                try:
+                    if k32.SetThreadAffinityMask(ctypes.c_void_p(th),
+                                                 ctypes.c_size_t(mask)):
+                        threads += 1
+                    else:
+                        failed += 1
+                finally:
+                    k32.CloseHandle(ctypes.c_void_p(th))
+        return {"ok": True, "mask": mask,
+                "cores": sorted({int(c) for c in cores}),
+                "threads": threads, "failed": failed}
+    finally:
+        k32.CloseHandle(ctypes.c_void_p(h))
+
+
+def restore_process_affinity(pid):
+    """恢复进程到全部逻辑核心（清掉自定义亲和）。"""
+    n = int((cpu_topology() or {}).get("logical") or 1)
+    return set_process_affinity_cores(pid, list(range(min(n, 64))))
+
+
+def set_process_memory_priority(pid, level):
+    """设置进程内存优先级（0..5，Win8+ 的 SetProcessInformation）。"""
+    try:
+        level = max(0, min(5, int(level)))
+    except Exception:
+        return {"ok": False, "err": "优先级取值 0..5"}
+
+    class MEMORY_PRIORITY_INFORMATION(ctypes.Structure):
+        _fields_ = [("MemoryPriority", wt.ULONG)]
+
+    k32, h = _open_process(pid)
+    if not h:
+        return {"ok": False, "err": "OpenProcess 失败"}
+    try:
+        info = MEMORY_PRIORITY_INFORMATION(level)
+        r = k32.SetProcessInformation(ctypes.c_void_p(h), 0,
+                                      ctypes.byref(info), ctypes.sizeof(info))
+        return {"ok": bool(r), "level": level,
+                "err": "" if r else "SetProcessInformation 失败"}
+    except Exception as e:
+        return {"ok": False, "err": str(e)}
+    finally:
+        k32.CloseHandle(ctypes.c_void_p(h))
+
+
+def set_process_io_priority(pid, level):
+    """设置进程 IO 优先级（0..4，NtSetInformationProcess 的 ProcessIoPriority=33）。"""
+    try:
+        level = max(0, min(4, int(level)))
+    except Exception:
+        return {"ok": False, "err": "优先级取值 0..4"}
+    try:
+        ntdll = ctypes.WinDLL("ntdll")
+        k32, h = _open_process(pid)
+        if not h:
+            return {"ok": False, "err": "OpenProcess 失败"}
+        try:
+            prio = wt.ULONG(level)
+            st = ntdll.NtSetInformationProcess(ctypes.c_void_p(h), 33,
+                                               ctypes.byref(prio),
+                                               ctypes.sizeof(prio))
+            return {"ok": st == 0, "level": level,
+                    "err": "" if st == 0 else "NtSetInformationProcess 0x%x"
+                    % (st & 0xFFFFFFFF)}
+        finally:
+            k32.CloseHandle(ctypes.c_void_p(h))
+    except Exception as e:
+        return {"ok": False, "err": str(e)}
+
+
+def release_working_set(pid=None):
+    """释放进程工作集（pid=None → 当前进程）。等价于 LaoYing 的 ReleaseHiddenWorkingSet。"""
+    try:
+        psapi = ctypes.WinDLL("psapi")
+        if pid is None:
+            h = _k32.GetCurrentProcess()
+            close = False
+            k32 = _k32
+        else:
+            k32, h = _open_process(pid)
+            close = True
+        if not h:
+            return {"ok": False, "err": "OpenProcess 失败"}
+        try:
+            r = psapi.EmptyWorkingSet(ctypes.c_void_p(h))
+            return {"ok": bool(r), "err": "" if r else "EmptyWorkingSet 失败"}
+        finally:
+            if close:
+                k32.CloseHandle(ctypes.c_void_p(h))
+    except Exception as e:
+        return {"ok": False, "err": str(e)}
+
+
+def release_working_set_all(limit=4000):
+    """释放所有可访问进程的工作集（无权限的系统进程会被跳过）。"""
+    done = skipped = 0
+    for p in list_processes(limit=limit):
+        pid = p.get("pid")
+        if not pid:
+            continue
+        if release_working_set(pid).get("ok"):
+            done += 1
+        else:
+            skipped += 1
+    return {"ok": True, "done": done, "skipped": skipped}
+
+
+def process_sched_state(pid):
+    """读回进程当前调度状态（亲和掩码 / 优先级类 / 内存优先级）。"""
+    k32, h = _open_process(pid, _PROCESS_QUERY_LIMITED_INFORMATION | 0x0400)
+    if not h:
+        return {"ok": False, "err": "OpenProcess 失败"}
+    try:
+        pmask = ctypes.c_size_t(0)
+        smask = ctypes.c_size_t(0)
+        k32.GetProcessAffinityMask(ctypes.c_void_p(h), ctypes.byref(pmask),
+                                   ctypes.byref(smask))
+        prio = int(k32.GetPriorityClass(ctypes.c_void_p(h)))
+        mem = None
+        try:
+            class MEMORY_PRIORITY_INFORMATION(ctypes.Structure):
+                _fields_ = [("MemoryPriority", wt.ULONG)]
+            info = MEMORY_PRIORITY_INFORMATION()
+            if k32.GetProcessInformation(ctypes.c_void_p(h), 0,
+                                         ctypes.byref(info), ctypes.sizeof(info)):
+                mem = int(info.MemoryPriority)
+        except Exception:
+            pass
+        return {"ok": True, "affinity": int(pmask.value),
+                "system_mask": int(smask.value), "priority": prio,
+                "priority_name": PRIORITY_CLASS_NAMES.get(prio, str(prio)),
+                "memory_priority": mem,
+                "memory_name": (MEM_PRIORITY_NAMES.get(mem, "—")
+                                if mem is not None else "—")}
+    finally:
+        k32.CloseHandle(ctypes.c_void_p(h))
+
+
+# --------------------------------------------------------------------------
+# 显卡显示名伪装（对标 LaoYing 的 GpuDisplayAlias）
+#
+# 原理：设备管理器与多数程序读的是显卡**驱动实例**键里的 DriverDesc /
+# HardwareInformation.* —— 改写它们即可让系统「显示成」另一款卡。
+# 原值会先写入备份文件，支持一键还原。注意：只改名字，不改硬件能力；
+# 部分反作弊 / 跑分工具会校验，改完可能报错 —— 界面里要明确提示。
+# --------------------------------------------------------------------------
+_GPU_CLASS = (r"SYSTEM\CurrentControlSet\Control\Class"
+              r"\{4d36e968-e325-11ce-bfc1-08002be10318}")
+_GPU_VALUE_KEYS = ("DriverDesc", "HardwareInformation.AdapterString",
+                   "HardwareInformation.ChipType")
+# 预设显卡名（按分组维护，界面用分隔线分组显示）。
+# `GPU_ALIAS_PRESETS` 是拍平后的全量清单 —— 单一数据源，别单独改它。
+GPU_ALIAS_GROUPS = [
+    ("NVIDIA GeForce · 桌面（RTX 50 / 40）", [
+        "NVIDIA GeForce RTX 5090", "NVIDIA GeForce RTX 5080",
+        "NVIDIA GeForce RTX 5070", "NVIDIA GeForce RTX 4090",
+        "NVIDIA GeForce RTX 4060",
+    ]),
+    ("NVIDIA GeForce · 桌面（RTX 30 / 20 / 16）", [
+        "NVIDIA GeForce RTX 3080", "NVIDIA GeForce RTX 3060",
+        "NVIDIA GeForce RTX 2080 Ti", "NVIDIA GeForce GTX 1660 SUPER",
+    ]),
+    ("NVIDIA GeForce · 入门 / 老卡（GTX 10 / 9 / 7）", [
+        "NVIDIA GeForce GTX 1080 Ti", "NVIDIA GeForce GTX 1070",
+        "NVIDIA GeForce GTX 1060", "NVIDIA GeForce GTX 1050 Ti",
+        "NVIDIA GeForce GT 1030", "NVIDIA GeForce GTX 960",
+        "NVIDIA GeForce GTX 750 Ti",
+    ]),
+    ("NVIDIA · 笔记本 / 专业卡", [
+        "NVIDIA GeForce RTX 4090 Laptop GPU", "NVIDIA GeForce RTX 3060 Laptop GPU",
+        "NVIDIA RTX A4000",
+    ]),
+    ("AMD Radeon", [
+        "AMD Radeon RX 7900 XTX", "AMD Radeon RX 7800 XT",
+        "AMD Radeon RX 6800 XT", "AMD Radeon RX 6700 XT",
+        "AMD Radeon RX 6600", "AMD Radeon RX 580",
+    ]),
+    ("Intel 核显 / Arc 独显", [
+        "Intel(R) Arc(TM) B580 Graphics", "Intel(R) Arc(TM) A770 Graphics",
+        "Intel(R) Iris(R) Xe Graphics", "Intel(R) UHD Graphics 770",
+        "Intel(R) UHD Graphics 630",
+    ]),
+]
+GPU_ALIAS_PRESETS = [n for _grp, _names in GPU_ALIAS_GROUPS for n in _names]
+_GPU_BACKUP_FILE = os.path.join(APP_DIR, "gpu_alias_backup.json")
+
+
+def _gpu_backup_load():
+    try:
+        with open(_GPU_BACKUP_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _gpu_backup_save(d):
+    try:
+        with open(_GPU_BACKUP_FILE, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=1)
+        return True
+    except Exception:
+        return False
+
+
+def gpu_adapters():
+    """枚举显卡驱动实例 → [{index, name, vendor, alias, backup}]。"""
+    if winreg is None:
+        return []
+    out = []
+    bk = _gpu_backup_load()
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _GPU_CLASS) as k:
+            n = winreg.QueryInfoKey(k)[0]
+            for i in range(n):
+                sub = winreg.EnumKey(k, i)
+                if not re.match(r"^\d{4}$", sub):
+                    continue
+                try:
+                    with winreg.OpenKey(k, sub) as sk:
+                        def q(v, _sk=sk):
+                            try:
+                                return winreg.QueryValueEx(_sk, v)[0]
+                            except OSError:
+                                return ""
+                        name = q("DriverDesc") or ""
+                        if not name:
+                            continue
+                        rec = bk.get(sub) or {}
+                        out.append({"index": sub, "name": name,
+                                    "vendor": q("ProviderName") or "",
+                                    "alias": rec.get("alias") or "",
+                                    "backup": bool(rec.get("values"))})
+                except OSError:
+                    continue
+    except FileNotFoundError:
+        return []
+    out.sort(key=lambda x: x["index"])
+    return out
+
+
+def gpu_alias_apply(index, new_name):
+    """把指定显卡的显示名改成 new_name（改前自动备份原值）。返回 {ok, msg}。"""
+    if winreg is None:
+        return {"ok": False, "msg": "当前环境无法访问注册表"}
+    new_name = (new_name or "").strip()
+    if not new_name:
+        return {"ok": False, "msg": "请填写要显示的显卡名称"}
+    if len(new_name) > 64:
+        return {"ok": False, "msg": "名称过长（≤64 字符）"}
+    idx = str(index).zfill(4)
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _GPU_CLASS + "\\" + idx,
+                            0, winreg.KEY_READ | winreg.KEY_WRITE) as sk:
+            cur = {}
+            for v in _GPU_VALUE_KEYS:
+                try:
+                    cur[v] = winreg.QueryValueEx(sk, v)
+                except OSError:
+                    continue
+            if not cur:
+                return {"ok": False, "msg": "该适配器没有可改写的名称值"}
+            bk = _gpu_backup_load()
+            if idx not in bk:                     # 只在首次改写时记录原值
+                bk[idx] = {"alias": new_name,
+                           "values": {k: [v[0], int(v[1])] for k, v in cur.items()}}
+            else:
+                bk[idx]["alias"] = new_name
+            for v, val in cur.items():
+                if isinstance(val[0], str):
+                    winreg.SetValueEx(sk, v, 0, val[1], new_name)
+        _gpu_backup_save(bk)
+        return {"ok": True,
+                "msg": "已改名为：%s（重新枚举显示设备或重启后可见）" % new_name}
+    except PermissionError:
+        return {"ok": False, "msg": "写入被拒绝（需要管理员权限）"}
+    except OSError as e:
+        return {"ok": False, "msg": "写入失败：%s" % e}
+
+
+def gpu_alias_restore(index):
+    """把指定显卡的显示名还原成备份的原值。"""
+    if winreg is None:
+        return {"ok": False, "msg": "当前环境无法访问注册表"}
+    idx = str(index).zfill(4)
+    bk = _gpu_backup_load()
+    rec = bk.get(idx)
+    if not rec or not rec.get("values"):
+        return {"ok": False, "msg": "没有该适配器的备份记录"}
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _GPU_CLASS + "\\" + idx,
+                            0, winreg.KEY_WRITE) as sk:
+            for v, pair in rec["values"].items():
+                try:
+                    winreg.SetValueEx(sk, v, 0, int(pair[1]), pair[0])
+                except OSError:
+                    continue
+        bk.pop(idx, None)
+        _gpu_backup_save(bk)
+        return {"ok": True, "msg": "已还原为原显示名"}
+    except PermissionError:
+        return {"ok": False, "msg": "写入被拒绝（需要管理员权限）"}
+    except OSError as e:
+        return {"ok": False, "msg": "还原失败：%s" % e}
 
 
 def _perf_script():
@@ -2543,12 +4932,40 @@ def _perf_conn_get():
 _net_lock = threading.Lock()
 _net_state = {
     "t": 0.0,          # 上次采样时间戳（time.monotonic）
+    "last_read": 0.0,  # 上次有人调用 net_info() 的时间（空闲降频用）
     "spans": {},       # 实例名 -> {"rx": Mbps, "tx": Mbps, "bw": 协商带宽bps}
     "err": None,
     "stop": False,
     "thread": None,
     "warming": False,  # 首轮建立 PDH 查询中（此时尚无样本，属正常）
 }
+
+
+# --------------------------------------------------------------------------
+# 监测暂停开关
+#
+# 窗口被最小化 / 收进系统托盘时，UI 侧所有 1 秒轮询都会被 page_active() 拦掉，
+# 这两个常驻采样线程也就再没人来取数 —— 与其「降频空转」，不如直接停：由 UI 在
+# 窗口状态变化时置位、恢复窗口时清零。暂停期间不 collect PDH、不喂 nvidia-smi、
+# 不读热区，整机彻底安静。
+#
+# 「核心调度」这类功能都是即写即生效的注册表 / 电源计划写入（进程亲和性、
+# 内存·IO 优先级、电源计划切换…），不依赖后台线程，所以停掉采样不影响它们。
+# --------------------------------------------------------------------------
+_MON_PAUSED = threading.Event()
+
+
+def set_monitor_paused(on):
+    """窗口最小化 / 收进托盘 → 暂停后台采样；重新显示 → 恢复。"""
+    if on:
+        _MON_PAUSED.set()
+    else:
+        _MON_PAUSED.clear()
+
+
+def monitors_paused():
+    """当前是否处于「窗口不可见、采样已停」的状态。"""
+    return _MON_PAUSED.is_set()
 
 
 def _net_loop():
@@ -2559,10 +4976,25 @@ def _net_loop():
 
     首次迭代要建立 PDH 查询（含 PowerShell 实例枚举，约 5~8s），
     这段耗时发生在后台线程里，不阻塞任何 HTTP 请求。
+
+    窗口被最小化 / 收进托盘时整个循环停下（见 _MON_PAUSED）：不 collect、
+    不查网卡；恢复后先丢掉一帧重建基线再继续。
     """
     prev = 0.0
     first = True
+    skip = 0                 # >0：这一帧只把 PDH 基准挪到「现在」，数值不写进状态
     while not _net_state["stop"]:
+        if _MON_PAUSED.is_set():
+            # 窗口不可见 → 彻底停采。顺手清掉速率并标「准备中」，免得 UI 显示
+            # 暂停前的旧值；恢复后的第一帧差值是跨暂停算出来的（只是平均值），
+            # 所以也一并丢掉，否则恢复瞬间会闪一个偏低的速率。
+            if not skip:
+                skip = 1
+            with _net_lock:
+                _net_state["warming"] = True
+                _net_state["spans"] = {}
+            time.sleep(0.5)
+            continue
         try:
             if first:
                 # 如实告知调用方「正在准备」，避免它误判为「无数据」
@@ -2572,23 +5004,27 @@ def _net_loop():
             nq = conn.get("net_q")
             if nq is not None:
                 vals = nq.collect_and_read()
-                spans = {}
-                for inst in conn.get("net_inst") or []:
-                    base = "\\Network Interface(%s)" % inst
-                    rx = vals.get(base + "\\Bytes Received/sec")
-                    tx = vals.get(base + "\\Bytes Sent/sec")
-                    bw = vals.get(base + "\\Current Bandwidth")
-                    if rx is None and tx is None:
-                        continue
-                    spans[inst] = {
-                        "rx": max(0.0, (rx or 0.0) * 8.0 / 1e6),   # B/s -> Mbps
-                        "tx": max(0.0, (tx or 0.0) * 8.0 / 1e6),
-                        "bw": bw,
-                    }
-                with _net_lock:
-                    _net_state["spans"] = spans
-                    _net_state["t"] = time.monotonic()
-                    _net_state["err"] = None
+                if skip:
+                    skip -= 1                 # 基线帧：只把 PDH 基准挪到「现在」
+                else:
+                    spans = {}
+                    for inst in conn.get("net_inst") or []:
+                        base = "\\Network Interface(%s)" % inst
+                        rx = vals.get(base + "\\Bytes Received/sec")
+                        tx = vals.get(base + "\\Bytes Sent/sec")
+                        bw = vals.get(base + "\\Current Bandwidth")
+                        if rx is None and tx is None:
+                            continue
+                        spans[inst] = {
+                            "rx": max(0.0, (rx or 0.0) * 8.0 / 1e6),   # B/s -> Mbps
+                            "tx": max(0.0, (tx or 0.0) * 8.0 / 1e6),
+                            "bw": bw,
+                        }
+                    with _net_lock:
+                        _net_state["spans"] = spans
+                        _net_state["t"] = time.monotonic()
+                        _net_state["err"] = None
+                        _net_state["warming"] = False
             else:
                 _net_loop_fallback()
         except Exception as e:
@@ -2596,10 +5032,13 @@ def _net_loop():
                 _net_state["err"] = "%s: %s" % (type(e).__name__, e)
         finally:
             if first:
-                with _net_lock:
-                    _net_state["warming"] = False
                 first = False
-        time.sleep(max(0.05, 1.0 - (time.monotonic() - prev)))
+        # 最近 20 秒没人读（停在别的页面）就降到 5 秒一次；
+        # 一旦有人读立刻恢复 1 秒节奏
+        with _net_lock:
+            last_read = float(_net_state.get("last_read") or 0.0)
+        idle = (time.monotonic() - last_read) > 20
+        time.sleep(5.0 if idle else max(0.05, 1.0 - (time.monotonic() - prev)))
         prev = time.monotonic()
 
 
@@ -2712,7 +5151,8 @@ _NET_META_SCRIPT = (
 
 
 _net_adapters_cache = {"t": 0.0, "data": None}
-_NET_ADAPTERS_TTL = 20.0
+_NET_ADAPTERS_TTL = float("inf")   # 进程内永久：网卡静态信息只在启动时查一次，
+                                 # 之后每秒轮询不再起 PowerShell（要更新用 force=True）
 _net_adapters_lock = threading.Lock()
 
 
@@ -2729,6 +5169,11 @@ def net_adapters(force=False):
         cur = _net_adapters_cache.get("data")
         if not force and cur is not None and (now - _net_adapters_cache["t"]) < _NET_ADAPTERS_TTL:
             return [dict(a) for a in cur]
+        # 上一次查询刚失败过就退避：否则「查不到 → 不写缓存 → 下一秒再查」会死循环，
+        # 退化成每秒起一个 PowerShell（拿不到网卡信息的老机器就是这么被吃满 CPU 的）
+        if not force and (now - float(_net_adapters_cache.get("fail_t") or 0.0)
+                          < _NET_ADAPTERS_FAIL_TTL):
+            return [dict(a) for a in cur] if cur else []
 
     rc, out = ps(_NET_META_SCRIPT, timeout=15)
     adapters = []
@@ -2751,12 +5196,17 @@ def net_adapters(force=False):
         adapters.append({"name": p[1], "media": p[2], "kind": kind,
                          "link_mbps": ls, "desc": p[4]})
 
-    # 只有拿到结果才写缓存，避免一次失败把空列表固化 20 秒
+    # 只有拿到结果才写「成功缓存」（避免一次失败把空列表固化 20 秒）；
+    # 失败则记一个失败时间戳，配合上面的退避避免每秒重试
     if adapters:
         with _net_adapters_lock:
             _net_adapters_cache["t"] = time.monotonic()
             _net_adapters_cache["data"] = [dict(a) for a in adapters]
-    elif cur is not None:
+            _net_adapters_cache["fail_t"] = 0.0
+        return adapters
+    with _net_adapters_lock:
+        _net_adapters_cache["fail_t"] = time.monotonic()
+    if cur is not None:
         return [dict(a) for a in cur]
     return adapters
 
@@ -2813,6 +5263,7 @@ def net_info():
     primary = _pick_primary(adapters)
 
     with _net_lock:
+        _net_state["last_read"] = time.monotonic()     # 告诉采样线程"有人在看"
         spans = dict(_net_state.get("spans") or {})
         seen = float(_net_state.get("t") or 0.0)
         err = _net_state.get("err")
@@ -2840,178 +5291,6 @@ def net_info():
     return {"adapters": adapters, "primary": primary,
             "rx_mbps": rx, "tx_mbps": tx, "speed_mbps": bw,
             "sample_age": age, "error": err, "warming": warming}
-
-
-# --------------------------------------------------------------------------
-# 内网测速（iperf3）
-# --------------------------------------------------------------------------
-def iperf3_path():
-    """找 iperf3.exe：优先随包目录 tools/，其次 PATH，最后常见安装路径。"""
-    import shutil as _sh
-    cands = [
-        os.path.join(ROOT, "tools", "iperf3.exe"),
-        os.path.join(APP_DIR, "iperf3.exe"),
-        os.path.join(APP_DIR, "tools", "iperf3.exe"),
-    ]
-    for c in cands:
-        if os.path.isfile(c):
-            return c
-    w = _sh.which("iperf3") or _sh.which("iperf3.exe")
-    if w:
-        return w
-    for c in (r"C:\Windows\System32\iperf3.exe",
-              r"C:\Program Files\iperf3\iperf3.exe"):
-        if os.path.isfile(c):
-            return c
-    return None
-
-
-_IPERF_SRV = {"proc": None, "port": 5201}
-
-
-def firewall_allow_iperf(port=5201):
-    """为 iperf3 端口添加入站放行规则（需管理员；已存在则跳过）。"""
-    if not is_admin():
-        return {"ok": False, "err": "需要管理员权限"}
-    name = "WinToolbox iperf3 %d" % int(port)
-    rc, out = run(["netsh", "advfirewall", "firewall", "show", "rule",
-                   "name=%s" % name], timeout=15)
-    if rc == 0:
-        return {"ok": True, "existed": True}
-    rc2, out2 = run(["netsh", "advfirewall", "firewall", "add", "rule",
-                     "name=%s" % name, "dir=in", "action=allow",
-                     "protocol=TCP", "localport=%d" % int(port)], timeout=20)
-    return {"ok": rc2 == 0, "err": (out2 or "").strip()[:200]}
-
-
-def firewall_remove_iperf(port=5201):
-    name = "WinToolbox iperf3 %d" % int(port)
-    run(["netsh", "advfirewall", "firewall", "delete", "rule",
-         "name=%s" % name], timeout=15)
-    return {"ok": True}
-
-
-def iperf_server_start(port=5201):
-    """启动 iperf3 服务端（让局域网其它设备对本机测速）。"""
-    exe = iperf3_path()
-    if not exe:
-        return {"ok": False, "err": "未找到 iperf3.exe"}
-    iperf_server_stop()
-    # 尽量放行防火墙（非管理员会静默失败，不影响启动）
-    fw = firewall_allow_iperf(port)
-    try:
-        p = subprocess.Popen(
-            [exe, "-s", "-p", str(int(port))],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            creationflags=0x08000000, cwd=os.path.dirname(exe) or None)
-        _IPERF_SRV["proc"] = p
-        _IPERF_SRV["port"] = int(port)
-        time.sleep(0.6)
-        if p.poll() is not None:
-            out = (p.stdout.read() or b"").decode("utf-8", "replace")
-            return {"ok": False, "err": out.strip() or "iperf3 启动后立即退出"}
-        return {"ok": True, "port": int(port), "pid": p.pid, "firewall": fw,
-                "hint": "局域网设备可用 iperf3 -c <本机IP> -p %d 测试" % int(port)}
-    except Exception as e:
-        return {"ok": False, "err": str(e)}
-
-
-def iperf_server_stop():
-    p = _IPERF_SRV.get("proc")
-    if p is not None:
-        try:
-            p.terminate()
-        except Exception:
-            pass
-        _IPERF_SRV["proc"] = None
-    return {"ok": True}
-
-
-def iperf_server_status():
-    p = _IPERF_SRV.get("proc")
-    running = bool(p is not None and p.poll() is None)
-    return {"running": running, "port": _IPERF_SRV.get("port", 5201)}
-
-
-def _parse_iperf_json(txt):
-    """从 iperf3 -J 输出里取：下载(接收)/上传(发送) Mbps。"""
-    rx = tx = None
-    try:
-        import json as _j
-        i = txt.find("{")
-        if i >= 0:
-            d = _j.loads(txt[i:])
-            end = d.get("end") or {}
-            # 本机作客户端：sum_sent=上传, sum_received=下载
-            s = (end.get("sum_sent") or {}).get("bits_per_second")
-            r = (end.get("sum_received") or {}).get("bits_per_second")
-            if s is not None:
-                tx = round(float(s) / 1e6, 1)
-            if r is not None:
-                rx = round(float(r) / 1e6, 1)
-            return rx, tx
-    except Exception:
-        pass
-    # 退化：正则抓 Bitrate
-    import re as _re
-    vals = [float(x) for x in _re.findall(r"([\d.]+)\s+(?:M|G)bits/sec", txt)]
-    if vals:
-        rx = rx or max(vals)
-    return rx, tx
-
-
-def iperf_client_run(host, port=5201, seconds=8, reverse=False,
-                     parallel=1, udp=False, on_line=None):
-    """对目标 iperf3 服务端做一次测速（本机为客户端）。
-
-    reverse=True 测「下载」（服务端发、本机收），False 测「上传」。
-    返回 {ok, rx_mbps, tx_mbps, raw}。
-    """
-    exe = iperf3_path()
-    if not exe:
-        return {"ok": False, "err": "未找到 iperf3.exe"}
-    cmd = [exe, "-c", str(host), "-p", str(int(port)),
-           "-t", str(int(seconds)), "-J", "-P", str(int(parallel or 1))]
-    if reverse:
-        cmd.append("-R")
-    if udp:
-        cmd.append("-u")
-    try:
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                             creationflags=0x08000000, cwd=os.path.dirname(exe) or None)
-        out = (p.stdout.read() or b"").decode("utf-8", "replace")
-        p.wait(timeout=seconds + 20)
-    except Exception as e:
-        return {"ok": False, "err": str(e)}
-    if "error" in out.lower() and "bits_per_second" not in out:
-        line = next((l for l in out.splitlines() if "error" in l.lower()), out[:200])
-        return {"ok": False, "err": line.strip(), "raw": out}
-    rx, tx = _parse_iperf_json(out)
-    if rx is None and tx is None:
-        return {"ok": False, "err": "未解析到测速结果", "raw": out}
-    # 反向(-R)时本机是接收方 → 结果应记为下载
-    if reverse:
-        rx, tx = (rx if rx is not None else tx), None
-    else:
-        tx = tx if tx is not None else rx
-        rx = None
-    return {"ok": True, "rx_mbps": rx, "tx_mbps": tx, "raw": out}
-
-
-def lan_ip():
-    """本机在局域网中的 IPv4（不做实际连接，仅用于选路由）。"""
-    import socket as _s
-    try:
-        s = _s.socket(_s.AF_INET, _s.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        try:
-            return _s.gethostbyname(_s.gethostname())
-        except Exception:
-            return "127.0.0.1"
 
 
 def _gpu_aggregate():
@@ -3140,68 +5419,156 @@ _slow_lock = threading.Lock()
 _FAST_SCRIPT = (
     "$t=$null;"
     "try{$z=Get-CimInstance -Namespace root/wmi -ClassName MSAcpi_ThermalZoneTemperature"
-    " -ErrorAction SilentlyContinue;"
-    "if($z){$a=($z|Measure-Object -Property CurrentTemperature -Average).Average;"
-    "$t=[math]::Round($a/10.0-273.15,1)}}catch{};"
+    " -ErrorAction SilentlyContinue|Sort-Object CurrentTemperature -Descending"
+    "|Select-Object -First 1;"
+    "if($z){$t=[math]::Round($z.CurrentTemperature/10.0-273.15,1)}}catch{};"
     "if($null -eq $t){try{$z2=Get-CimInstance Win32_PerfFormattedData_Counters_ThermalZoneInformation"
-    " -ErrorAction SilentlyContinue;"
-    "if($z2){$b=($z2|Measure-Object -Property Temperature -Average).Average;"
-    "$t=[math]::Round([double]$b-273.15,1)}}catch{}};"
+    " -ErrorAction SilentlyContinue|Sort-Object Temperature -Descending|Select-Object -First 1;"
+    "if($z2){$t=[math]::Round([double]$z2.Temperature-273.15,1)}}catch{}};"
     "if($null -eq $t){$t='NA'};"
     "'CPUTEMP='+$t;"
 )
 
-_CPU_TEMP_CACHE = {"t": 0.0, "v": None, "ok": True}
-# TTL 略大于采样间隔：后台线程每秒预热，UI 每次读都能命中，刷新耗时接近 0
-_CPU_TEMP_TTL = 1.8
-_CPU_TEMP_HIST = []          # 最近几次读数，用于平滑 ACPI 热区的 ±3℃ 抖动
+# ---- CPU 温度直读：PDH「Thermal Zone Information」（~1ms，免 PowerShell 进程）----
+# 原实现每次读温度都要起一个 PowerShell（0.5~1.4s），后台每秒采样也吃 CPU；
+# PDH 是 Windows 自带计数器 API，一次读取亚毫秒级，才能真正做到 1s 级刷新。
+_tz_conn = {"q": None, "t": 0.0, "hi": False}
+_TZ_TTL = 300.0
+_tz_lock = threading.Lock()
+_HI_TZ = r"\Thermal Zone Information(*)\High Precision Temperature"
+_RAW_TZ = r"\Thermal Zone Information(*)\Temperature"
+
+
+def _tz_open():
+    """建立热区计数器查询：优先「High Precision Temperature」（1/10 K 刻度）。
+
+    直接用通配符路径 open，**不**先 pdh_instances 预检（枚举计数器集要 1s+）；
+    建立后丢弃首个样本（PDH 首次 collect 会拿到初始化假值，实测偏高近 7℃）。
+    """
+    q = _PdhQuery([_HI_TZ])
+    if q.open():
+        q.collect_and_read()          # 丢首帧
+        return q, True
+    q = _PdhQuery([_RAW_TZ])
+    if q.open():
+        q.collect_and_read()          # 丢首帧
+        return q, False
+    return None, False
+
+
+def _cpu_temp_pdh():
+    """PDH 直读 CPU 温度(℃)。多热区取**最高**（最热区代表 CPU；取平均会把
+    主板/环境/电池热区混进来拉低读数）。不可用返回 None。"""
+    if _pdh is None:
+        return None
+    now = time.time()
+    with _tz_lock:
+        if _tz_conn["q"] is None or now - _tz_conn["t"] > _TZ_TTL:
+            if _tz_conn["q"] is not None:
+                _tz_conn["q"].close()
+            q, hi = _tz_open()
+            _tz_conn.update(q=q, t=now, hi=hi)
+        q = _tz_conn["q"]
+        if q is None:
+            return None
+        try:
+            vals = q.collect_and_read()       # 瞬时计数器，首次 collect 即可读
+        except Exception:
+            _tz_conn.update(q=None, t=0.0)
+            return None
+        hi = _tz_conn["hi"]
+    raw = [float(v) for v in vals.values() if v and float(v) > 0]
+    if not raw:
+        return None
+    mx = max(raw)
+    return round((mx / 10.0 - 273.15) if hi else (mx - 273.15), 1)
+
+
+_CPU_TEMP_CACHE = {"t": 0.0, "v": None}
+# PDH 直读 ~1ms，可跟 1s 刷新同频（旧实现受限于 PowerShell 往返，只能 1.8s）
+_CPU_TEMP_TTL = 1.0
+_CPU_TEMP_HIST = []          # 中位数滤波窗口
+_CPU_TEMP_EMA = {"v": None}
+
+
+def _cpu_temp_filter(v):
+    """ACPI 热区读数噪声大：实测 1s 间隔内就会 65.1 ↔ 71.1 反复跳（±3℃ 持续抖动）。
+    窗口 5 中位数压掉连续尖峰 → EMA(0.35) 平滑到 ±0.5℃ 内；
+    真实负载突变（>15℃，如空闲→满载）立即跟随，不迟钝。"""
+    if v is None:
+        return None
+    _CPU_TEMP_HIST.append(v)
+    del _CPU_TEMP_HIST[:-5]
+    med = sorted(_CPU_TEMP_HIST)[len(_CPU_TEMP_HIST) // 2]
+    prev = _CPU_TEMP_EMA["v"]
+    if prev is None:
+        out = med
+    elif abs(med - prev) > 15:
+        out = med                      # 负载突变，立即跟随
+    else:
+        out = round(prev * 0.65 + med * 0.35, 1)
+    _CPU_TEMP_EMA["v"] = out
+    return out
 
 
 def cpu_temp():
-    """CPU 温度。WMI/ACPI 读取要起 PowerShell（约 0.5s），缓存 1.8 秒。
+    """CPU 温度(℃)：PDH 直读优先（~1ms），失败才回退 PowerShell CIM（~1s）。
 
-    ACPI 热区读数本身在几十度范围内有 ±3℃ 的抖动（不同传感器交替成为最热区），
-    所以对最近 3 次取平均再返回，读数更稳；读不到返回 None。
+    多热区取最高值；读数经中位数 + EMA 抑制 ACPI 固有抖动。读不到返回 None。
     """
-    now = time.time()
-    if now - _CPU_TEMP_CACHE["t"] < _CPU_TEMP_TTL:
-        return _CPU_TEMP_CACHE["v"]
-    v = None
-    try:
-        rc, out = ps(_FAST_SCRIPT, timeout=12)
-        for line in (out or "").splitlines():
-            line = line.strip()
-            if line.startswith("CPUTEMP="):
-                try:
-                    v = float(line.split("=", 1)[1])
-                except Exception:
-                    v = None
-    except Exception:
+    with _CPU_TEMP_LOCK:
+        now = time.time()
+        if now - _CPU_TEMP_CACHE["t"] < _CPU_TEMP_TTL:
+            return _CPU_TEMP_CACHE["v"]
         v = None
-    if v is not None:
-        _CPU_TEMP_HIST.append(v)
-        del _CPU_TEMP_HIST[:-3]
-        v = round(sum(_CPU_TEMP_HIST) / len(_CPU_TEMP_HIST), 1)
-    _CPU_TEMP_CACHE.update(t=now, v=v)
-    return v
+        try:
+            v = _cpu_temp_pdh()
+        except Exception:
+            v = None
+        if v is None:                      # 部分机器没有该计数器集 → 回退旧路径
+            try:
+                rc, out = ps(_FAST_SCRIPT, timeout=12)
+                for line in (out or "").splitlines():
+                    line = line.strip()
+                    if line.startswith("CPUTEMP="):
+                        try:
+                            v = float(line.split("=", 1)[1])
+                        except Exception:
+                            v = None
+            except Exception:
+                v = None
+        v = _cpu_temp_filter(v)
+        _CPU_TEMP_CACHE.update(t=now, v=v)
+        return v
 
 
 _GPU_AGG_CACHE = {"t": 0.0, "v": None}
-_GPU_AGG_TTL = 10.0          # 只是兜底值（有 PDH 时会被逐卡占用覆盖），拉长到 10s 省开销
+_GPU_AGG_TTL = 30.0          # 纯兜底值（有 PDH 时被逐卡占用覆盖），拉长到 30s 省一次 WMI
 
 
 def _gpu_aggregate_cached():
     """GPU 聚合占用（兜底）。WMI 枚举约 1 秒，缓存 10 秒。"""
-    now = time.time()
-    if now - _GPU_AGG_CACHE["t"] < _GPU_AGG_TTL:
-        return _GPU_AGG_CACHE["v"]
-    v = _gpu_aggregate()
-    _GPU_AGG_CACHE.update(t=now, v=v)
-    return v
+    with _GPU_AGG_LOCK:
+        now = time.time()
+        if now - _GPU_AGG_CACHE["t"] < _GPU_AGG_TTL:
+            return _GPU_AGG_CACHE["v"]
+        v = _gpu_aggregate()
+        _GPU_AGG_CACHE.update(t=now, v=v)
+        return v
+
+
+_WMI_PERF = {"t": 0.0, "v": None}
 
 
 def _wmi_perf_fallback():
-    """PDH 磁盘不可用时的回退：走 WMI PerfFormattedData。"""
+    """PDH 磁盘不可用时的回退：走 WMI PerfFormattedData。
+
+    带 4 秒缓存：以前没有缓存，PDH 建不起来的老机器会退化成**每秒一个 PowerShell**，
+    这是「老电脑一打开就卡」的隐藏放大器。
+    """
+    now = time.time()
+    if _WMI_PERF["v"] is not None and now - _WMI_PERF["t"] < 4.0:
+        return [dict(x) for x in _WMI_PERF["v"]]
     disks = []
     rc, out = ps(_perf_script(), timeout=25)
     for line in (out or "").splitlines():
@@ -3259,14 +5626,21 @@ _sampler = {"thread": None, "last_read": 0.0}
 
 def _temp_loop():
     while True:
+        if _MON_PAUSED.is_set():
+            # 窗口最小化 / 收进托盘：温度与 GPU 采样整体停掉 —— 不读热区、
+            # 不起 nvidia-smi。恢复窗口时 UI 会立刻补一次，不必等下一轮。
+            time.sleep(0.5)
+            continue
+        idle = (time.time() - _sampler["last_read"]) > 20
         try:
             cpu_temp()
         except Exception:
             pass
-        try:
-            _nvidia_smi_cached()
-        except Exception:
-            pass
+        if not idle:      # 没人看的时候连 nvidia-smi / GPU 引擎也不喂
+            try:
+                _nvidia_smi_cached()
+            except Exception:
+                pass
         # GPU Engine 按 pid 聚合 → _GPU_BY_PID（CPU 调试页进程表的 GPU 占用数据源）。
         # 必须常驻喂养：概览页不开时 perf_stats 不跑，进程表的 GPU 列会全空。
         # 函数内部有 ≥0.9s 节流，与 perf_stats 撞车安全
@@ -3274,8 +5648,7 @@ def _temp_loop():
             _gpu_engine_utils()
         except Exception:
             pass
-        # 最近没人读数据（窗口最小化 / 停留在别的页面）就降频，避免白耗 CPU
-        idle = (time.time() - _sampler["last_read"]) > 20
+        # 最近没人读数据（停在别的页面）就降频，避免白耗 CPU
         time.sleep(5.0 if idle else 1.0)
 
 
@@ -3438,18 +5811,6 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/api/netinfo":
             return self._json({"ok": True, "data": net_info()})
 
-        if p == "/api/speedtest/status":
-            return self._json({"ok": True, "data": {
-                "iperf3": bool(iperf3_path()), "server": iperf_server_status(),
-                "lan_ip": lan_ip()}})
-
-        if p == "/api/speedtest/server":
-            act = (q.get("action", ["start"])[0] or "start").lower()
-            port = int(q.get("port", ["5201"])[0] or 5201)
-            if act == "stop":
-                return self._json({"ok": True, "data": iperf_server_stop()})
-            return self._json({"ok": True, "data": iperf_server_start(port)})
-
         if p == "/api/processes":
             limit = int(q.get("limit", ["50"])[0])
             return self._json({"ok": True, "data": list_processes(limit)})
@@ -3474,13 +5835,6 @@ class Handler(BaseHTTPRequestHandler):
 
         if p == "/api/policies/scan":
             return self._json({"ok": True, "data": policies_scan()})
-
-        if p == "/api/security/scan":
-            base = q.get("path", [os.path.expanduser("~\\Desktop")])[0]
-            deep = q.get("deep", ["0"])[0] in ("1", "true")
-            if not os.path.isdir(base):
-                return self._json({"ok": False, "error": "目录不存在: %s" % base}, 400)
-            return self._json({"ok": True, "data": scan_path_for_infection(base, deep=deep)})
 
         if p == "/api/network/dns":
             return self._json({"ok": True, "data": dns_test(q.get("mode", ["mixed"])[0])})

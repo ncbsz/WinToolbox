@@ -2261,6 +2261,110 @@
           "value": "NewTabPageContentEnabled"
         }
       ]
+    },
+    {
+      "id": "perf_power_throttle",
+      "category": "performance",
+      "risk": "safe",
+      "name": "关闭电源节流（Power Throttling）",
+      "desc": "后台程序不再被系统降频限流，录制 / 编译 / 压缩等后台重活明显提速（笔记本更耗电）",
+      "checkKey": "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Power\\PowerThrottling",
+      "checkValue": "PowerThrottlingOff",
+      "optimizedValue": 1,
+      "optimize": [
+        {
+          "op": "reg_set",
+          "key": "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Power\\PowerThrottling",
+          "value": "PowerThrottlingOff",
+          "type": "REG_DWORD",
+          "data": 1
+        }
+      ],
+      "restore": [
+        {
+          "op": "reg_del",
+          "key": "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Power\\PowerThrottling",
+          "value": "PowerThrottlingOff"
+        }
+      ]
+    },
+    {
+      "id": "perf_driver_lock",
+      "category": "update",
+      "risk": "policy",
+      "name": "阻止 Windows 更新推送驱动（锁定驱动库）",
+      "desc": "质量更新不再附带驱动，避免稳定的驱动被自动替换（对应 LaoYing 的驱动数据库锁定）",
+      "checkKey": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate",
+      "checkValue": "ExcludeWUDriversInQualityUpdate",
+      "optimizedValue": 1,
+      "optimize": [
+        {
+          "op": "reg_set",
+          "key": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate",
+          "value": "ExcludeWUDriversInQualityUpdate",
+          "type": "REG_DWORD",
+          "data": 1
+        }
+      ],
+      "restore": [
+        {
+          "op": "reg_del",
+          "key": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate",
+          "value": "ExcludeWUDriversInQualityUpdate"
+        }
+      ]
+    },
+    {
+      "id": "perf_gpu_pref",
+      "category": "performance",
+      "risk": "safe",
+      "name": "全局显卡首选项设为“高性能”",
+      "desc": "双显卡机型让程序优先使用独显（等价于 设置 > 显示 > 图形 里的“高性能”）",
+      "checkKey": "HKCU\\SOFTWARE\\Microsoft\\DirectX\\UserGpuPreferences",
+      "checkValue": "DirectXUserGlobalSettings",
+      "optimizedValue": "GpuPreference=2;",
+      "optimize": [
+        {
+          "op": "reg_set",
+          "key": "HKCU\\SOFTWARE\\Microsoft\\DirectX\\UserGpuPreferences",
+          "value": "DirectXUserGlobalSettings",
+          "type": "REG_SZ",
+          "data": "GpuPreference=2;"
+        }
+      ],
+      "restore": [
+        {
+          "op": "reg_del",
+          "key": "HKCU\\SOFTWARE\\Microsoft\\DirectX\\UserGpuPreferences",
+          "value": "DirectXUserGlobalSettings"
+        }
+      ]
+    },
+    {
+      "id": "gaming_hags",
+      "category": "gaming",
+      "risk": "safe",
+      "name": "开启硬件加速 GPU 计划（HAGS）",
+      "desc": "GPU 调度交给硬件，降低游戏延迟（需重启；个别老驱动可能不稳定）",
+      "checkKey": "HKLM\\SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers",
+      "checkValue": "HwSchMode",
+      "optimizedValue": 2,
+      "optimize": [
+        {
+          "op": "reg_set",
+          "key": "HKLM\\SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers",
+          "value": "HwSchMode",
+          "type": "REG_DWORD",
+          "data": 2
+        }
+      ],
+      "restore": [
+        {
+          "op": "reg_del",
+          "key": "HKLM\\SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers",
+          "value": "HwSchMode"
+        }
+      ]
     }
   ]
 }

@@ -35,7 +35,6 @@ const svg = (n, cls) =>
 const NAV = [
   { key: 'overview',   name: '概览',        icon: 'home'   },
   { key: 'optimize',   name: '系统优化',    icon: 'tune'   },
-  { key: 'security',   name: '安全检测',    icon: 'shield' },
   { key: 'software',   name: '软件管理',    icon: 'box'    },
   { key: 'startup',    name: '启动与服务',  icon: 'power'  },
   { key: 'performance',name: '内存与性能',  icon: 'speed'  },
@@ -158,7 +157,6 @@ PAGES.overview = async () => {
         <div style="display:flex;flex-wrap:wrap;gap:8px">
           <button class="btn primary" id="q-trim">一键整理内存</button>
           <button class="btn" id="q-diag">网络快速诊断</button>
-          <button class="btn" id="q-scan">扫描桌面是否被感染</button>
         </div>
         <div class="notice info" style="margin-top:14px;margin-bottom:0">
           本工具是<b>功能整合版</b>：优化项来自 ZyperWin++ 的思路，卸载/启动项/服务来自 HiBit Uninstaller，
@@ -225,7 +223,6 @@ PAGES.overview = async () => {
     busy(e.target, false);
   };
   $('#q-diag').onclick = () => { location.hash = '#network'; };
-  $('#q-scan').onclick = () => { location.hash = '#security'; };
 };
 
 /* ---------------- 系统优化 ---------------- */
@@ -336,66 +333,6 @@ PAGES.optimize = async () => {
     } catch (er) { toast(er.message, 'err'); busy(e.target, false); }
   };
   function objKeysOn() { return Object.keys(state.sel).filter(k => state.sel[k]); }
-};
-
-/* ---------------- 安全检测 ---------------- */
-PAGES.security = async () => {
-  content.innerHTML = `
-    <div class="notice err">
-      <b>Synaptics / XRed 感染型病毒检测</b><br>
-      本模块只读扫描 PE 文件，比对病毒壳特征（CODE 节 629760 字节、MD5
-      <span class="mono">33fbe30e…6542</span>）以及 <span class="mono">xred.mooo.com</span> 等特征字符串。
-      <b>不会执行或修改任何文件。</b>
-    </div>
-    <div class="card">
-      <div class="card-head"><h2>选择扫描范围</h2></div>
-      <div class="toolbar">
-        <select id="s-preset">
-          <option value="__desktop">桌面</option>
-          <option value="__downloads">下载</option>
-          <option value="__docs">文档</option>
-          <option value="__d">D:\\</option>
-          <option value="__c">C:\\</option>
-          <option value="__custom">自定义路径…</option>
-        </select>
-        <input type="text" id="s-path" style="display:none;width:340px" placeholder="例如 D:\\桌面\\桌面文件">
-        <label class="chk"><input type="checkbox" id="s-deep"> 深度扫描（连非标准壳也查，较慢）</label>
-        <button class="btn primary" id="s-go">开始扫描</button>
-      </div>
-      <div id="s-out"></div>
-    </div>`;
-
-  const preset = $('#s-preset'), pth = $('#s-path');
-  preset.onchange = () => { pth.style.display = preset.value === '__custom' ? '' : 'none'; };
-  $('#s-go').onclick = async e => {
-    let base = pth.value.trim();
-    const v = preset.value;
-    if (v === '__custom' && !base) return toast('请输入路径', 'err');
-    const out = $('#s-out');
-    out.innerHTML = '<div class="empty"><span class="spin"></span> 扫描中，请稍候…</div>';
-    busy(e.target, true, '扫描中');
-    try {
-      const r = await api(`/api/security/scan?path=${encodeURIComponent(base)}&deep=${$('#s-deep').checked ? 1 : 0}`);
-      if (!r.hits.length) {
-        out.innerHTML = `<div class="notice ok" style="margin:0">
-          扫描完成：检查了 <b>${r.scanned}</b> 个 PE 文件，<b>未发现</b> Synaptics / XRed 感染特征。</div>`;
-      } else {
-        const inf = r.hits.filter(h => h.verdict === 'infected-loader');
-        out.innerHTML = `<div class="notice err">
-            发现 <b>${r.hits.length}</b> 个可疑文件（其中 <b>${inf.length}</b> 个确认为病毒壳）。<br>
-            处理方式：① 先跑全盘杀毒并开启“防感染模式”；② 把被感染文件<b>删除</b>，
-            从官方渠道重新下载；③ 用脚本把资源段里的干净原件提取出来再扫描确认。
-          </div>
-          <div class="scroll-y">${r.hits.map(h => row(`
-            <div class="grow"><div class="t mono">${esc(h.path)}</div>
-              <div class="s">${fmtBytes(h.size)}</div></div>
-            <span class="tag ${h.verdict === 'infected-loader' ? 'err' : 'warn'}">
-              ${h.verdict === 'infected-loader' ? '确认感染' : '可疑'}</span>`)).join('')}</div>`;
-        toast(`发现 ${r.hits.length} 个可疑文件`, 'err');
-      }
-    } catch (er) { out.innerHTML = `<div class="notice err">${esc(er.message)}</div>`; }
-    busy(e.target, false);
-  };
 };
 
 /* ---------------- 软件管理 ---------------- */
@@ -783,11 +720,10 @@ PAGES.policies = async () => {
 /* ============================================================
    router / shell
    ============================================================ */
-function buildNav(alertCount) {
+function buildNav() {
   $('#nav-list').innerHTML = NAV.map(n => `
     <div class="nav-item ${state.page === n.key ? 'active' : ''}" data-k="${n.key}">
       ${svg(n.icon)}<span>${n.name}</span>
-      ${n.key === 'security' && alertCount ? `<span class="badge">${alertCount}</span>` : ''}
     </div>`).join('');
   $('#nav-list').querySelectorAll('.nav-item').forEach(it => it.onclick = () => {
     location.hash = '#' + it.dataset.k;
@@ -798,7 +734,7 @@ async function go(key) {
   if (!PAGES[key]) key = 'overview';
   state.page = key;
   if (state.chartTimer) { clearInterval(state.chartTimer); state.chartTimer = null; }
-  buildNav(0);
+  buildNav();
   const nav = NAV.find(n => n.key === key);
   $('#page-title').textContent = nav ? nav.name : key;
   try {

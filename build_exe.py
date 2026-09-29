@@ -2,13 +2,13 @@
 """WinToolbox 一键构建脚本。
 
 用法：
-    python build_exe.py              # 构建 exe 并放到 <项目根>\\<版本>\\安装\\
-    python build_exe.py --zip        # 另外在该目录重建便携版 zip
+    python build_exe.py              # 构建 exe，输出到 WinToolbox\\ 与项目根目录
+    python build_exe.py --zip        # 另外在 WinToolbox\\ 重建便携版 zip
 
 特性：
   * 自动下载 UPX（首次），用 portable.spec 打包 + UPX 压缩；
-  * 版本号从 app.py 的 APP_VER 读取，产物自动落到对应版本的「安装」目录；
-  * 不再往项目根目录另放一份 exe（安装目录那份就是唯一成品）；
+  * 版本号从 app.py 的 APP_VER 读取；
+  * 产物直接放 WinToolbox 目录与项目根目录（不建版本子目录）；
   * --zip 时校验 zip < 25MB 且完整性通过。
 """
 import os
@@ -21,7 +21,7 @@ import urllib.request
 import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(HERE)                     # 项目根（下面按版本号分目录）
+ROOT = os.path.dirname(HERE)                     # 项目根
 TOOLS = os.path.join(ROOT, "_buildtools")
 UPX_URL = "https://github.com/upx/upx/releases/download/v5.2.1/upx-5.2.1-win64.zip"
 PYI = r"C:\Users\29566\.workbuddy\binaries\python\envs\wintoolbox\Scripts\pyinstaller.exe"
@@ -34,12 +34,6 @@ def app_version():
     with open(os.path.join(HERE, "app.py"), encoding="utf-8") as f:
         m = re.search(r'^APP_VER\s*=\s*["\']([^"\']+)["\']', f.read(), re.M)
     return m.group(1) if m else ""
-
-
-def dist_dir():
-    """成品目录：<项目根>\\<版本>\\安装\\"""
-    v = app_version()
-    return os.path.join(ROOT, v, "安装") if v else os.path.join(ROOT, "安装")
 
 
 def ensure_upx():
@@ -73,12 +67,12 @@ def build():
         sys.exit("PyInstaller 构建失败")
     exe = os.path.join(HERE, "dist", "WinToolbox.exe")
     print("exe: %.2f MB" % (os.path.getsize(exe) / 1048576))
-    d = dist_dir()
-    os.makedirs(d, exist_ok=True)
-    dst = os.path.join(d, "WinToolbox.exe")
-    shutil.copy2(exe, dst)
-    print("已同步:", dst)
-    with open(os.path.join(d, "使用说明.txt"), "w", encoding="utf-8") as f:
+    # 成品：WinToolbox 目录 + 项目根目录各一份
+    for dst in (os.path.join(HERE, "WinToolbox.exe"),
+                os.path.join(ROOT, "WinToolbox.exe")):
+        shutil.copy2(exe, dst)
+        print("已同步:", dst)
+    with open(os.path.join(HERE, "使用说明.txt"), "w", encoding="utf-8") as f:
         f.write(readme_text())
     return exe
 
@@ -94,9 +88,7 @@ def readme_text():
 
 
 def make_zip(exe):
-    d = dist_dir()
-    os.makedirs(d, exist_ok=True)
-    zpath = os.path.join(d, "WinToolbox-便携版.zip")
+    zpath = os.path.join(HERE, "WinToolbox-便携版.zip")
     with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
         zf.write(exe, "WinToolbox-便携版/WinToolbox/WinToolbox.exe")
         zf.writestr("WinToolbox-便携版/WinToolbox/使用说明.txt",

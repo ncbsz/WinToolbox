@@ -5,7 +5,7 @@ a = Analysis(
     ['app.py'],
     pathex=[],
     binaries=[],
-    datas=[('rules.json', '.'), ('tools', 'tools')],
+    datas=[('rules.json', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -71,4 +71,8 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=['icon.ico'],
+    # 请求管理员权限：exe 的 manifest 会写入 requireAdministrator，
+    # 双击即由 Windows 直接弹出 UAC —— 进程从创建那一刻就带管理员令牌，
+    # 服务 / 注册表 / 策略 / DNS 设置等写入类功能全部可用。
+    uac_admin=True,
 )
