@@ -21,91 +21,99 @@
 """
 
 # ---------------- 圆角档位 ----------------
-R_SHELL = 14        # 窗口外框 / 标题栏顶角
-R_CARD = 12         # 卡片 / 表格 / 列表 / 标签页面板
-R_CTL = 8           # 按钮 / 输入框 / 导航项 / 菜单项
-R_NOTICE = 10       # 提示条
-R_MENU = 8          # 菜单 / 工具提示
-R_LOGO = 10         # 品牌方块
-R_CHK = 5           # 勾选框指示器（按 16px 计）
+R_SHELL = 10        # 窗口外框 / 标题栏顶角
+R_CARD = 8          # 卡片 / 表格 / 列表 / 标签页面板
+R_CTL = 6           # 按钮 / 输入框 / 导航项 / 菜单项
+R_NOTICE = 8        # 提示条
+R_MENU = 6          # 菜单 / 工具提示
+R_LOGO = 8          # 品牌方块
+R_CHK = 4           # 勾选框指示器（按 16px 计）
 
 # ---------------- 主题色预设（Win11 个性化常用色系） ----------------
-DEFAULT_ACCENT = "#0067C0"          # Windows 蓝，也是「恢复默认」的目标
+DEFAULT_ACCENT = "#2B8CFF"            # Fluent 蓝（效果图主色），也是「恢复默认」的目标
 ACCENT_PRESETS = [
+    ("Fluent 蓝", "#2B8CFF"),
+    ("青色", "#22D3EE"),
     ("Windows 蓝", "#0067C0"),
     ("天青", "#0099BC"),
     ("青绿", "#00B294"),
-    ("翠绿", "#107C10"),
-    ("琥珀", "#CA5010"),
-    ("绯红", "#C42B1C"),
-    ("紫罗兰", "#8764B8"),
-    ("石墨", "#4A4A4A"),
+    ("翠绿", "#22C55E"),
+    ("琥珀", "#F59E0B"),
+    ("绯红", "#EF4444"),
+    ("紫罗兰", "#8B5CF6"),
+    ("石墨", "#64748B"),
 ]
 
-# ---------------- light palette（Win11 层底：浅灰底 + 白卡片） ----------------
+# ---------------- light palette（Fluent Light：浅灰页底 + 白卡片 + 细边框） ----------------
 LIGHT = {
-    "BG": "#F3F3F3",            # 窗口 / 页面层底（Win11 mica 近似）
-    "PANEL": "#FFFFFF",         # 卡片 / 输入框 / 表格
-    "PANEL2": "#FAFAFA",        # 次级面（悬停）
-    "LINE": "#E5E5E5",
-    "LINE2": "#D6D6D6",
-    "TRACK": "#ECECEC",         # 进度条轨道（比 LINE 更淡，几乎隐形）
-    "BORDER_BOTTOM": "#C8C8C8",  # 控件底边（Win11 按钮的立体感来源）
-    "TEXT": "#1A1A1A",
-    "TEXT2": "#5C5C5C",
-    "TEXT3": "#8A8A8A",
-    "OK": "#0F7B0F",
-    "OK_BG": "#DFF6DD",
-    "WARN": "#9D5D00",
-    "WARN_BG": "#FFF4CE",
-    "ERR": "#C42B1C",
-    "ERR_BG": "#FDE7E9",
-    "ACCENT_CPU": "#0078D4",
-    "ACCENT_MEM": "#8B5CF6",
-    "ACCENT_GPU": "#F2A900",
-    "ACCENT_DISK": "#107C10",
-    "ACCENT_NET": "#C42B1C",
-    "ACCENT_CPU_SOFT": "#E5F1FB",
-    "ACCENT_MEM_SOFT": "#EFE9FB",
-    "ACCENT_GPU_SOFT": "#FFF4CE",
-    "ACCENT_DISK_SOFT": "#DFF6DD",
-    "ACCENT_NET_SOFT": "#FDE7E9",
-    "ACCENT_GPU_TEXT": "#B07A00",
-    "ACCENT_NET_TEXT": "#C42B1C",
-    "TEMP": "#00A0A0",          # 温度进度条专用色
+    "BG": "#F5F7FA",            # 页面层底
+    "CARD": "#FFFFFF",          # 卡片底
+    "CARD2": "#EEF2F7",         # 次级面：导航选中 / 悬停
+    "PANEL": "#FFFFFF",         # 输入框 / 表格 / 导航 / 顶栏
+    "PANEL2": "#F5F7FA",        # 输入框悬停
+    "LINE": "#E3E8EF",          # 发丝边框
+    "LINE2": "#CFD6DF",
+    "TRACK": "#EAEEF3",         # 进度条轨道
+    "BORDER_BOTTOM": "#D8DEE7",
+    "TEXT": "#131A22",          # 近黑正文
+    "TEXT2": "#4A5561",
+    "TEXT3": "#78838F",
+    "OK": "#15803D",
+    "OK_BG": "#DCFCE7",
+    "WARN": "#B45309",
+    "WARN_BG": "#FEF3C7",
+    "ERR": "#B91C1C",
+    "ERR_BG": "#FEE2E2",
+    # 指标配色（与深色同色系，浅底上压暗一档保证对比度）
+    "ACCENT_CPU": "#0E7490",
+    "ACCENT_MEM": "#1D6FE0",
+    "ACCENT_GPU": "#15803D",
+    "ACCENT_DISK": "#2563EB",
+    "ACCENT_NET": "#0E7490",
+    "ACCENT_CPU_SOFT": "#CFFAFE",
+    "ACCENT_MEM_SOFT": "#DBEAFE",
+    "ACCENT_GPU_SOFT": "#DCFCE7",
+    "ACCENT_DISK_SOFT": "#DBEAFE",
+    "ACCENT_NET_SOFT": "#CFFAFE",
+    "ACCENT_GPU_TEXT": "#15803D",
+    "ACCENT_NET_TEXT": "#0E7490",
+    "TEMP": "#0E7490",
 }
 
-# ---------------- dark palette（Win11 深色：深灰底 + 略亮卡片） ----------------
+# ---------------- dark palette（Fluent Dark：深蓝黑页底 + 抬升卡片，见效果图） ----------------
 DARK = {
-    "BG": "#202020",
-    "PANEL": "#2B2B2B",
-    "PANEL2": "#333333",
-    "LINE": "#3A3A3A",
-    "LINE2": "#4A4A4A",
-    "TRACK": "#3A3A3A",
-    "BORDER_BOTTOM": "#161616",
-    "TEXT": "#FFFFFF",
-    "TEXT2": "#CFCFCF",
-    "TEXT3": "#9A9A9A",
-    "OK": "#6CCB5F",
-    "OK_BG": "#214C1F",
-    "WARN": "#FFCD75",
-    "WARN_BG": "#5C4813",
-    "ERR": "#FF99A4",
-    "ERR_BG": "#5C1B1E",
-    "ACCENT_CPU": "#4CC2FF",
-    "ACCENT_MEM": "#B78DFF",
-    "ACCENT_GPU": "#FFD166",
-    "ACCENT_DISK": "#6CCB5F",
-    "ACCENT_NET": "#FF99A4",
-    "ACCENT_CPU_SOFT": "#1E3A5F",
-    "ACCENT_MEM_SOFT": "#3A2E5C",
-    "ACCENT_GPU_SOFT": "#4A3A14",
-    "ACCENT_DISK_SOFT": "#214C1F",
-    "ACCENT_NET_SOFT": "#5C1B1E",
-    "ACCENT_GPU_TEXT": "#FFD166",
-    "ACCENT_NET_TEXT": "#FF99A4",
-    "TEMP": "#4CC9C9",
+    "BG": "#0B0F16",            # 页面层底（最暗）
+    "PANEL": "#0E131B",         # 侧栏 / 顶栏 / 输入框
+    "PANEL2": "#151B25",        # 输入框悬停
+    "CARD": "#121826",          # 卡片底（比页底亮一档）
+    "CARD2": "#1A2231",         # 次级面：导航选中 / 悬停 / 表头
+    "LINE": "#1F2937",          # 发丝边框
+    "LINE2": "#2B3648",
+    "TRACK": "#1B2432",         # 进度条轨道
+    "BORDER_BOTTOM": "#080B10",
+    "TEXT": "#E8EEF7",
+    "TEXT2": "#94A3B8",
+    "TEXT3": "#64748B",
+    "OK": "#22C55E",
+    "OK_BG": "#0E2A1B",
+    "WARN": "#F59E0B",
+    "WARN_BG": "#2E2208",
+    "ERR": "#F87171",
+    "ERR_BG": "#331317",
+    # 指标配色（效果图：CPU 青 / 内存 蓝 / GPU 绿 / 磁盘 蓝 / 网络 青）
+    "ACCENT_CPU": "#22D3EE",
+    "ACCENT_MEM": "#2B8CFF",
+    "ACCENT_GPU": "#22C55E",
+    "ACCENT_DISK": "#3B82F6",
+    "ACCENT_NET": "#22D3EE",
+    "ACCENT_CPU_SOFT": "#0C2E3A",
+    "ACCENT_MEM_SOFT": "#10233F",
+    "ACCENT_GPU_SOFT": "#0E2A1B",
+    "ACCENT_DISK_SOFT": "#14274A",
+    "ACCENT_NET_SOFT": "#0C2E3A",
+    "ACCENT_GPU_TEXT": "#22C55E",
+    "ACCENT_NET_TEXT": "#22D3EE",
+    "TEMP": "#22D3EE",
 }
 
 
@@ -166,14 +174,6 @@ def is_valid_hex(c):
         return True
     except ValueError:
         return False
-
-
-def bg_rgba(hex_color, bg_alpha):
-    """把背景色转成 rgba()，用于「背景半透明、文字不透明」。"""
-    if bg_alpha >= 0.999:
-        return hex_color
-    r, g, b = hex_to_rgb(hex_color)
-    return "rgba(%d, %d, %d, %d)" % (r, g, b, max(0, min(255, round(bg_alpha * 255))))
 
 
 # ==========================================================================
@@ -239,13 +239,14 @@ def accent_family(accent, dark=False):
         panel = DARK["PANEL"]
         bg = DARK["BG"]
         return {
-            "BLUE": lighten(a, 0.45),
-            "BLUE_HOVER": lighten(a, 0.58),
-            "BLUE_ACTIVE": lighten(a, 0.32),
-            "BLUE_SOFT": mix(a, panel, 0.80),
-            "BLUE_SOFT2": mix(a, bg, 0.88),
-            "NOTICE_TEXT": lighten(a, 0.62),
-            "ON_ACCENT": contrast_text(lighten(a, 0.45)),
+            # 深色下强调色不能提太亮，否则发灰发白（效果图是饱和亮蓝）
+            "BLUE": lighten(a, 0.22),
+            "BLUE_HOVER": lighten(a, 0.36),
+            "BLUE_ACTIVE": darken(a, 0.08),
+            "BLUE_SOFT": mix(a, panel, 0.74),
+            "BLUE_SOFT2": mix(a, bg, 0.86),
+            "NOTICE_TEXT": lighten(a, 0.42),
+            "ON_ACCENT": contrast_text(lighten(a, 0.22)),
         }
     return {
         "BLUE": a,
@@ -266,23 +267,18 @@ def palette(dark=False, accent=None):
 
 
 def get_color(name, dark=False):
-    """取单个色值（供自绘控件 / 动态字符串用）。"""
-    return palette(dark).get(name, "#000000")
+    """取单个色值（供自绘控件 / 动态字符串用）。
 
-
-# ==========================================================================
-# 透明度：滑块 20~100 → 背景 alpha
-# ==========================================================================
-# 下限 20% 若直接映射成 0.20，浅色底会过淡、深字对比不足；
-# 故把 20% 映射到 0.55，保证最低档也能清楚阅读（文字本身始终实心）。
-_ALPHA_MIN = 0.55
-
-
-def _map_alpha(op):
-    op = max(20, min(100, int(op)))
-    if op >= 100:
-        return 1.0
-    return _ALPHA_MIN + (1.0 - _ALPHA_MIN) * (op - 20) / 80.0
+    ⚠️ **找不到时返回主题正文色，不是 `#000000`**：
+    曾经兜底写死黑色，于是「名字打错」在浅色主题下只是变成黑字（看着正常），
+    到深色主题就成了**黑字压近黑底 = 完全隐形**（`FG`/`MUTED` 就是这么坑了一个月）。
+    兜底成正文色后，即使再打错也只是「显示成普通文字」，不会看不见。
+    真正的防线是审计里的「用到的颜色名必须都在调色板里」断言。
+    """
+    p = palette(dark)
+    if name in p:
+        return p[name]
+    return p.get("TEXT", "#000000")
 
 
 # ==========================================================================
@@ -363,22 +359,21 @@ def indicator_icons(dark=False, scale=1.0, accent=None):
 # ==========================================================================
 # QSS 主体
 # ==========================================================================
-def build_qss(dark=False, scale=1.0, font_base=13, opacity=100, accent=None):
+def build_qss(dark=False, scale=1.0, font_base=13, accent=None):
     """Return the full QSS string.
 
     `scale`     — UI 尺寸倍数（= 系统 DPI 缩放，仅在「窗口化」时人为收一点）。
     `font_base` — 基准字号（px），默认 13px，等价于 Windows 100% 缩放下 9pt。
-    `opacity`   — 窗口背景不透明度（20~100）。**只作用于背景**，文字始终保持实心。
     `accent`    — 主题色；不传则用当前全局主题色（手动指定 / 跟随系统）。
+
+    背景一律为**实心主题色**。「背景不透明度」滑块已按用户要求移除 ——
+    它靠 alpha 实现，而窗口是 `WA_TranslucentBackground`（圆角需要），
+    alpha 一降就透出桌面壁纸的亮色，深色下表现为「拉低 → 变白」，
+    是结构性缺陷；与其保留一个必然出问题的开关，不如去掉。
     """
     P = palette(dark, accent if accent is not None else get_accent())
     if not font_base or font_base <= 0:
         font_base = 13
-    try:
-        op = int(opacity)
-    except Exception:
-        op = 100
-    alpha = _map_alpha(op)
 
     def s(v):
         try:
@@ -392,13 +387,16 @@ def build_qss(dark=False, scale=1.0, font_base=13, opacity=100, accent=None):
         except Exception:
             return str(v)
 
+    # 背景 / 线条色：都是**实心主题色**（透明度功能已移除，不会再走 rgba）。
+    # 两个名字都保留，是为了不动下面几百处 QSS 模板里的 {bg(...)} / {bgl(...)}
+    # 调用点 —— 改动成本最低，也不会漏改。
     def bg(name):
-        """背景类颜色：随透明度变化。"""
-        return bg_rgba(P[name], alpha)
+        """背景类颜色。"""
+        return P[name]
 
     def bgl(name):
-        """线条/分隔类颜色：同样随透明度淡化，但保留最低可见度。"""
-        return bg_rgba(P[name], max(0.35, alpha))
+        """线条 / 分隔类颜色（已与 bg 等价，保留名字以免大改 QSS 模板）。"""
+        return P[name]
 
     # 勾选框指示器：生成 PNG 并拼出 QSS 片段（失败则留空，退回系统默认样式）
     _chk_qss = ""
@@ -422,7 +420,8 @@ def build_qss(dark=False, scale=1.0, font_base=13, opacity=100, accent=None):
 
     return f"""
 * {{
-    font-family: "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", sans-serif;
+    font-family: "Segoe UI Variable Text", "Segoe UI Variable", "Segoe UI",
+                 "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
     font-size: {f(13)};
     color: {P["TEXT"]};
 }}
@@ -443,6 +442,9 @@ QWidget#Page {{ background: transparent; }}
 QScrollArea#PageScroll {{ background: transparent; border: none; }}
 QWidget#PageViewport {{ background: transparent; }}
 QWidget#ContentArea {{ background: transparent; }}   /* 由 AtmosphereArea.paintEvent 画 Mica 氛围层 */
+/* 卡片内部的滚动区（概览「详细信息」）：透明底、无边框，滚动条只在需要时出现 */
+QScrollArea#CardScroll {{ background: transparent; border: none; }}
+QWidget#CardScrollInner {{ background: transparent; }}
 
 /* ---------- frameless shell ---------- */
 QFrame#Shell {{
@@ -453,6 +455,7 @@ QFrame#Shell {{
 QFrame#Shell[maximized="true"] {{ border-radius: 0px; border: {s(1)} solid {bgl("LINE")}; }}
 
 QWidget#TitleBar {{
+    /* 标题栏跟随主题：浅色=浅底深字 / 深色=深底浅字（与内容区同底，才不会有「深色边框」） */
     background: {bg("PANEL")};
     border-top-left-radius: {s(R_SHELL)}; border-top-right-radius: {s(R_SHELL)};
     border-bottom: {s(1)} solid {bgl("LINE")};
@@ -460,18 +463,18 @@ QWidget#TitleBar {{
 QWidget#TitleBar[maximized="true"] {{
     border-top-left-radius: 0px; border-top-right-radius: 0px;
 }}
-QLabel#TitleText {{ font-size: {f(12.5)}; color: {P["TEXT2"]}; background: transparent; }}
+QLabel#TitleText {{ font-size: {f(12.5)}; color: {P["TEXT"]}; background: transparent; }}
 
 /* 尺寸由代码 setFixedSize 控制，QSS 只负责外观，避免 min-width 被拉伸 */
 QPushButton#TitleBtn {{
     background: transparent; border: none; border-radius: {s(R_CTL)};
-    font-size: {f(11)}; color: {P["TEXT"]};
+    font-size: {f(11)}; color: {P["TEXT2"]};
 }}
-QPushButton#TitleBtn:hover  {{ background: {bg("LINE")}; }}
-QPushButton#TitleBtn:pressed {{ background: {bg("LINE2")}; }}
+QPushButton#TitleBtn:hover  {{ background: {bg("LINE")}; color: {P["TEXT"]}; }}
+QPushButton#TitleBtn:pressed {{ background: {bgl("LINE2")}; color: {P["TEXT"]}; }}
 QPushButton#TitleBtnClose {{
     background: transparent; border: none; border-radius: {s(R_CTL)};
-    font-size: {f(11)}; color: {P["TEXT"]};
+    font-size: {f(11)}; color: {P["TEXT2"]};
 }}
 QPushButton#TitleBtnClose:hover {{ background: {P["ERR"]}; color: #FFFFFF; }}
 QPushButton#TitleBtnClose:pressed {{ background: #A8261A; color: #FFFFFF; }}
@@ -504,12 +507,13 @@ QLabel#MetricK {{
     background: transparent;
 }}
 QLabel#MetricV {{
-    font-family: "Cascadia Mono", Consolas, "Microsoft YaHei UI", monospace;
-    font-size: {f(26)}; font-weight: 600; color: {P["TEXT"]};
+    font-family: "Segoe UI Variable Display", "Segoe UI Variable Text",
+                 "Microsoft YaHei UI", sans-serif;
+    font-size: {f(28)}; font-weight: 700; color: {P["TEXT"]};
     background: transparent;
 }}
 QLabel#MetricU {{
-    font-family: "Cascadia Mono", Consolas, monospace;
+    font-family: "Segoe UI Variable Text", "Segoe UI", sans-serif;
     font-size: {f(12)}; color: {P["TEXT2"]}; background: transparent;
 }}
 QLabel#MetricSub {{ font-size: {f(11.5)}; color: {P["TEXT3"]}; background: transparent; }}
@@ -534,29 +538,39 @@ QLabel#CatName  {{ font-size: {f(13.5)}; font-weight: 600; background: transpare
 QLabel#CatSub   {{ font-size: {f(11.5)}; color: {P["TEXT3"]}; background: transparent; }}
 QLabel#CatArrow {{ font-size: {f(16)}; color: {P["TEXT3"]}; background: transparent; }}
 
-/* nav buttons：选中态用主题色（Win11 导航惯例） */
+/* nav buttons：选中态 = 左侧高亮竖条 + 主题色淡底（Fluent / 效果图写法） */
 QPushButton#NavItem {{
-    text-align: left; padding: {s(9)} {s(14)}; border: none; border-radius: {s(R_CTL)};
-    background: transparent; color: {P["TEXT"]}; font-size: {f(13.5)};
+    text-align: left; padding: {s(9)} {s(12)} {s(9)} {s(13)};
+    border: none; border-left: {s(3)} solid transparent;
+    border-top-right-radius: {s(R_CTL)}; border-bottom-right-radius: {s(R_CTL)};
+    border-top-left-radius: 0px; border-bottom-left-radius: 0px;
+    background: transparent; color: {P["TEXT2"]}; font-size: {f(13.5)};
 }}
-QPushButton#NavItem:hover   {{ background: {bg("LINE")}; }}
+QPushButton#NavItem:hover   {{ background: {bg("CARD2")}; color: {P["TEXT"]}; }}
 QPushButton#NavItem:checked {{
-    background: {bg("BLUE_SOFT")}; color: {P["BLUE"]}; font-weight: 600;
+    background: {bg("BLUE_SOFT")}; color: {P["TEXT"]}; font-weight: 600;
+    border-left: {s(3)} solid {P["BLUE"]};
 }}
 
-/* generic buttons（Win11：浅底 + 细边框 + 略深的底边） */
+/* generic buttons（Fluent 次要按钮：抬起的浅色面 + 细边框）
+   深色下不能再用 PANEL —— 它比卡片还暗，按钮会"陷"进卡片里看不见；
+   改用 CARD2 做抬起面，边框用 LINE2 保证可辨。 */
 QPushButton {{
-    background: {bg("PANEL")}; border: {s(1)} solid {bgl("LINE")};
+    background: {bg("CARD2") if dark else bg("PANEL")};
+    border: {s(1)} solid {bgl("LINE2")};
     border-bottom-color: {bgl("BORDER_BOTTOM")};
     border-radius: {s(R_CTL)}; padding: {s(6)} {s(14)}; color: {P["TEXT"]};
 }}
-QPushButton:hover    {{ background: {bg("PANEL2")}; }}
+QPushButton:hover    {{ background: {bg("LINE2") if dark else bg("PANEL2")};
+                        border-color: {P["BLUE"] if dark else bgl("LINE2")}; }}
 QPushButton:pressed  {{ background: {bg("LINE")}; border-bottom-color: {bgl("LINE")}; }}
-QPushButton:disabled {{ color: {P["TEXT3"]}; border-color: {bgl("LINE")}; background: {bg("BG")}; }}
+QPushButton:disabled {{ color: {P["TEXT3"]}; border-color: {bgl("LINE")};
+                        background: {bg("BG") if dark else bg("BG")}; }}
 QPushButton:focus {{ border-color: {P["BLUE"]}; }}
 QPushButton#Primary {{
     background: {P["BLUE"]}; border: {s(1)} solid {P["BLUE"]};
     border-bottom-color: {darken(P["BLUE"], 0.18)};
+    border-radius: {s(14)}; padding: {s(7)} {s(20)};
     color: {P["ON_ACCENT"]}; font-weight: 600;
 }}
 QPushButton#Primary:hover   {{ background: {P["BLUE_HOVER"]}; border-color: {P["BLUE_HOVER"]}; }}
@@ -583,12 +597,30 @@ QPushButton#SegBtn:checked {{
     color: {P["ON_ACCENT"]}; font-weight: 600;
 }}
 
-/* cards */
+/* cards：顶部极轻的提亮渐变，让卡片在深色底上有「抬升」感（效果图的层次） */
 QFrame#Card {{
-    background: {bg("PANEL")}; border: {s(1)} solid {bgl("LINE")}; border-radius: {s(R_CARD)};
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                stop:0 {lighten(bg("CARD"), 0.035)}, stop:1 {bg("CARD")});
+    border: {s(1)} solid {bgl("LINE")}; border-radius: {s(R_CARD)};
 }}
+QFrame#HubCard {{
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                stop:0 {lighten(bg("CARD"), 0.035)}, stop:1 {bg("CARD")});
+    border: {s(1)} solid {bgl("LINE")}; border-radius: {s(R_CARD)};
+}}
+QFrame#HubCard:hover {{
+    background: {bg("CARD2")};
+    border: {s(1)} solid {bgl("BLUE")};
+}}
+QLabel#HubTitle {{ font-size: {f(15)}; font-weight: 600; color: {bg("TEXT")};
+                   background: transparent; }}
+QLabel#HubDesc  {{ font-size: {f(12)}; color: {bg("TEXT3")};
+                   background: transparent; }}
+QLabel#HubIcon  {{ font-size: {f(22)}; background: transparent; }}
 QFrame#StatCard {{
-    background: {bg("PANEL")}; border: {s(1)} solid {bgl("LINE")}; border-radius: {s(R_CARD)};
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                stop:0 {lighten(bg("CARD"), 0.05)}, stop:1 {bg("CARD")});
+    border: {s(1)} solid {bgl("LINE")}; border-radius: {s(R_CARD)};
 }}
 
 /* inputs */
@@ -600,6 +632,13 @@ QLineEdit, QComboBox, QSpinBox {{
 QLineEdit:hover, QComboBox:hover, QSpinBox:hover {{ background: {bg("PANEL2")}; }}
 QLineEdit:focus, QComboBox:focus, QSpinBox:focus {{ border: {s(1)} solid {P["BLUE"]}; background: {bg("PANEL")}; }}
 QComboBox::drop-down {{ border: none; width: {s(20)}; }}
+
+/* 指标卡标题行里的紧凑下拉（切换 GPU0/GPU1、切换本机网卡） */
+QComboBox#MetricPick {{
+    font-size: {f(11)}; color: {P["TEXT2"]};
+    padding: {s(1)} {s(6)}; min-height: {s(16)}; border-radius: {s(R_CTL)};
+}}
+QComboBox#MetricPick::drop-down {{ width: {s(16)}; }}
 /* QSpinBox 被 QSS 样式化后默认上下按钮会失效（上键点不动），
    必须显式定义 up/down-button 及箭头，热区才可靠 */
 QSpinBox::up-button {{
@@ -681,10 +720,10 @@ QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
 QScrollBar:horizontal {{ background: transparent; height: {s(10)}; }}
 QScrollBar::handle:horizontal {{ background: {bgl("LINE2")}; border-radius: {s(5)}; min-width: {s(30)}; }}
 
-/* progress bars（细胶囊：轨道几乎隐形，只让填充说话） */
+/* progress bars（完整胶囊：radius 恒等于 height/2，两端全圆） */
 QProgressBar {{
     background: {bg("TRACK")}; border: none; border-radius: {s(4)};
-    min-height: {s(7)}; max-height: {s(7)}; text-align: center; color: transparent;
+    min-height: {s(8)}; max-height: {s(8)}; text-align: center; color: transparent;
 }}
 QProgressBar::chunk {{ background: {P["BLUE"]}; border-radius: {s(4)}; }}
 QProgressBar#Warn::chunk {{ background: {P["WARN"]}; }}

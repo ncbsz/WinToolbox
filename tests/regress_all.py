@@ -12,7 +12,18 @@ import sys
 import time
 
 os.environ["WTB_NO_BROWSER"] = "1"
-os.environ["QT_QPA_PLATFORM"] = "offscreen"
+# ⚠️ 平台：默认走**真实平台但不闪窗**（`WA_DontShowOnScreen`）。
+#    不用 offscreen：字体家族为空 → 布局回归量到的全是错的字体度量。
+#    （2026-10-12 以前写死 offscreen 时，Windows 上 ①~⑨ 段之后连切主题色
+#    **必然访问冲突 0xC0000005**，崩在 `setStyleSheet` 里。根因：⑨ 段
+#    `clean()` 经 `confirm_ex(backup_label=...)` 创建的**真实 QMessageBox**
+#    从未显示也没被删除，一直挂在清理页子树里；重抛光整棵树扫到它即崩。
+#    已双重修复：① 下方打桩区把 `A.confirm_ex` 也桩掉；② app.py 的
+#    confirm/confirm_ex/safety_confirm 用完即 `deleteLater()`。）
+#    需要无显示的 Linux/CI 可用 `QT_QPA_PLATFORM=offscreen` 覆盖。
+if not os.environ.get("QT_QPA_PLATFORM"):
+    os.environ["QT_QPA_PLATFORM"] = "windows" if os.name == "nt" else "offscreen"
+PLATFORM = os.environ["QT_QPA_PLATFORM"]
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROJ = os.path.dirname(HERE)                       # WinToolbox/
@@ -48,6 +59,13 @@ A.QMessageBox.critical = staticmethod(lambda *a, **k: None)
 A.QMessageBox.question = staticmethod(lambda *a, **k: A.QMessageBox.No)
 A.QMessageBox.exec = lambda self, *a, **k: 0          # 自定义 QMessageBox 也不阻塞
 A._center_dialog = lambda *a, **k: None
+# ⚠️ confirm_ex 也必须打桩：它传 backup_label 时不走 A.confirm，会创建**真实的**
+#    QMessageBox。exec 虽被桩成立即返回，对话框却一直挂在页面子树里（本 harness
+#    全程 processEvents 驱动，deleteLater 的 deferred delete 永远不处理），
+#    之后 ⑩ 段连切主题色 → setStyleSheet 重抛光整棵树扫到这个从未显示的对话框
+#    → 0xC0000005（2026-10-12 实测，bisect 定位）。返回 (False, False) = 取消，
+#    与原先 exec 被桩后的行为一致。
+A.confirm_ex = lambda *a, **k: (False, False)
 A.safety_confirm = lambda *a, **k: (
     DIALOG.append(("safety_confirm", str(a[2] if len(a) > 2 else ""))), False)[1]
 
@@ -71,11 +89,13 @@ STUBS = {
     "reg_delete": (True, ""), "clean_junk": [],
     "residual_clean": {"ok": True, "msg": ["stub"]},
     "policies_fix": {"results": [], "backups": [], "backup_dir": ""},
-    "set_update": {"enabled": False}, "set_defender": {"enabled": False},
+    # set_update / set_defender 现在返回**逐项结果列表**（每项带 ok/note），
+    # UI 靠它如实报告成功与失败 —— 返回旧的 dict 会被当成"0/1 失败"
+    "set_update": [{"name": "wuauserv", "want": 4, "ok": True, "note": "stub"}],
+    "set_defender": [{"name": "WinDefend", "want": 4, "ok": True, "note": "stub"}],
     "snapshot_and_apply": [], "restore_rules": [],
     "cpu_set_state": {"ok": True}, "cpu_set_plan": {"ok": True},
     "set_process_affinity": {"ok": True, "mask": 255},
-    "ecore_disable": {"ok": True, "numproc": 8}, "ecore_restore": {"ok": True},
     "net_repair": [],
     # 电源计划 / 显卡伪装：会改系统，一律打桩
     "gpu_alias_apply": {"ok": True, "msg": "stub"},
@@ -95,7 +115,9 @@ for fn, ret in STUBS.items():
 
 RESULTS = []
 T_START = time.time()
-TIME_LIMIT = 600          # 内部超时保护：超时后跳过剩余项但仍打印已完成结果
+TIME_LIMIT = 900          # 内部超时保护：超时后跳过剩余项但仍打印已完成结果
+# （900 而不是 600：改走真实平台后用的是**真字体度量**，`fit_labels` 比
+#   offscreen 的空字体慢，跑到 ⑩ 之后才可能到点 —— 600 会把后半截全 SKIP。）
 
 
 def check(name, fn):
@@ -123,7 +145,13 @@ qapp = QApplication([])
 info = A.probe_system_info(qapp)
 w = A.MainWindow(settings={}, admin_mode=True, dark=False, sysinfo=info)
 w.resize(1220, 820)
+if PLATFORM != "offscreen":
+    # 真实平台但不上屏：既不闪窗，也不走 offscreen 易崩的 backing store
+    from PySide6.QtCore import Qt as _Qt
+    w.setAttribute(_Qt.WA_DontShowOnScreen, True)
 w.show()
+print("[env] QT_QPA_PLATFORM=%s | 实际上报=%s"
+      % (PLATFORM, qapp.platformName()))
 
 
 def pump(sec=0.0, n=30):
@@ -144,6 +172,19 @@ def wait_api(sec=8.0):
         time.sleep(0.04)
 
 
+def wait_until(pred, sec=90.0):
+    """按**条件**轮询（不是固定时长）——后台扫描/线程的耗时随机器负载波动，
+    固定时长等待在高负载下会偶发超时。满足条件即刻返回，最多等 sec 秒。
+    返回条件是否成立。"""
+    t0 = time.time()
+    while time.time() - t0 < sec:
+        qapp.processEvents()
+        if pred():
+            return True
+        time.sleep(0.04)
+    return bool(pred())
+
+
 def checked(table):
     """表格第 0 列已勾选行数 / 总行数。"""
     k = 0
@@ -157,11 +198,14 @@ def checked(table):
 
 pump(0.5)
 
-PAGES = ["overview", "optimize", "cputune", "gpu", "software", "startup",
-         "performance", "network", "dns", "cleanup", "policies", "settings"]
+# ⚠️ 这里的页 = NAV 全部项（含从「清理与诊断」大类进去的 4 个隐藏页）。
+# 隐藏页也要逐页回归 —— 它们只是不在侧栏出现，功能一点没少。
+PAGES = ["overview", "optimize", "cputune", "power", "gpu", "software",
+         "startup", "performance", "network", "dns", "cleanup", "tools",
+         "hub", "regtool", "systool", "policies", "settings"]
 
 print("=" * 62)
-print("① 逐页加载 + refresh（12 页）")
+print("① 逐页加载 + refresh（17 页）")
 print("=" * 62)
 for key in PAGES:
     w.goto(key)
@@ -184,17 +228,33 @@ pump(0.5)
 check("overview.tick()", lambda: (ov.tick(), pump(0.05)))
 check("overview.tick_perf()", lambda: (ov.tick_perf(), wait_api(4)))
 check("overview._load_net()", lambda: (ov._load_net(), wait_api(3)))
+wait_api(5)          # 等「详细信息」延后 2.5s 才跑的硬件查询（主板/显示器/磁盘/声卡/显存）
 check("主指标已出值", lambda: need(
     not all(ov.metrics[k]["val"].text() in ("", "—") for k in ("cpu", "mem")), "主指标为空"))
-check("系统信息已填充", lambda: need(ov.cards["os"][0].text() not in ("", "—"), "系统信息为空"))
+check("详细信息已填充（系统/处理器/主板/内存/显示器）", lambda: need(
+    ov._sys_line.text() not in ("", "—") and
+    all(ov._detail[k].text() not in ("", "—")
+        for k in ("cpu", "board", "mem", "mon")), "详细信息有空行"))
+check("详细信息含显卡/磁盘/声卡/网卡行", lambda: need(
+    all(ov._detail[k].text() not in ("", "—")
+        for k in ("gpu", "disk", "sound", "net")), "显卡/磁盘/声卡/网卡行为空"))
+check("底部「网络」详情卡已移除", lambda: need(
+    not hasattr(ov, "_render_net") and not hasattr(ov, "net_box"), "网络详情卡仍在"))
 check("存储行已渲染", lambda: need(ov.disk_box.count() > 0, "无磁盘行"))
-check("GPU / 磁盘活动行已渲染", lambda: need(
-    ov.gpu_box.count() > 0 and ov.diskact_box.count() > 0, "显卡/磁盘活动行缺失"))
+check("磁盘活动行已渲染", lambda: need(ov.diskact_box.count() > 0, "磁盘活动行缺失"))
+check("GPU 详情卡已移除（并入指标卡 + 详细信息）", lambda: need(
+    not hasattr(ov, "gpu_pick") and not hasattr(ov, "gpu_box"), "GPU 详情卡仍在"))
 check("实时曲线已移除", lambda: need(
     not hasattr(ov, "chart") and not hasattr(ov, "legend"), "曲线控件仍在"))
-check("GPU 下拉已填充", lambda: need(ov.gpu_pick.count() >= 2, "GPU 列表为空"))
-check("切换 GPU 筛选", lambda: (ov.gpu_pick.setCurrentIndex(1), pump(0.3),
-                            ov.gpu_pick.setCurrentIndex(0), pump(0.3)))
+check("指标卡·显卡下拉（GPU0/GPU1…）", lambda: (
+    need(ov.metrics["gpu"]["pick"].count() >= 2, "显卡指标卡选项不足"),
+    ov.metrics["gpu"]["pick"].setCurrentIndex(1), pump(0.3),
+    ov.metrics["gpu"]["pick"].setCurrentIndex(0), pump(0.3)))
+check("指标卡·网卡下拉（切换本机网卡）", lambda: (
+    need(ov.metrics["net"]["pick"].count() >= 1, "网卡指标卡选项为空"),
+    ov.metrics["net"]["pick"].setCurrentIndex(
+        min(1, ov.metrics["net"]["pick"].count() - 1)), pump(0.3),
+    ov.metrics["net"]["pick"].setCurrentIndex(0), pump(0.3)))
 check("数值补间对象存在", lambda: need(
     ov.metrics["cpu"]["tween"] is not None and ov.metrics["mem"]["bar_tween"] is not None,
     "补间对象缺失"))
@@ -225,31 +285,40 @@ print("=" * 62)
 print("④ CPU 调试页")
 print("=" * 62)
 cp = w.pages["cputune"]
+pw = w.pages["power"]        # 电源计划相关控件在「电源管理」页
 w.goto("cputune")
 cp.refresh()
 wait_api(8)
+pw.refresh()
+wait_api(6)
 check("拓扑已识别", lambda: need(bool(cp.topo), "拓扑为空"))
 check("核名标签已填", lambda: need(cp.lb_name.text() not in ("", "—"), "CPU 名为空"))
-check("电源计划下拉已填充", lambda: need(cp.plan_combo.count() > 0, "计划为空"))
-check("切换计划并读取参数", lambda: (cp.plan_combo.setCurrentIndex(
-    min(1, cp.plan_combo.count() - 1)), pump(0.5), wait_api(3)))
+check("电源计划下拉已填充", lambda: need(pw.plan_combo.count() > 0, "计划为空"))
+check("切换计划并读取参数", lambda: (pw.plan_combo.setCurrentIndex(
+    min(1, pw.plan_combo.count() - 1)), pump(0.5), wait_api(3)))
 check("进程表已加载", lambda: need(cp.proc_table.rowCount() > 0, "进程表为空"))
 check("进程搜索过滤", lambda: (cp.proc_q.setText("a"), pump(0.3),
                           cp.proc_q.setText(""), pump(0.2)))
 check("选中进程 + 绑核（打桩）", lambda: (cp.proc_table.selectRow(0), pump(0.2),
                                    cp.set_affinity("P"), pump(0.3)))
 check("每核占用 tick", lambda: (cp.tick(), wait_api(3)))
-check("写入处理器状态（打桩）", lambda: (cp.apply_states(), pump(0.3)))
-check("写入 EPP（打桩）", lambda: (cp.apply_epp(), pump(0.3)))
-check("切换电源计划（打桩）", lambda: (cp.apply_plan(), pump(0.3)))
-check("E-core 关闭（confirm 取消）", lambda: (cp.ecore_off(), pump(0.3)))
-check("恢复全核（confirm 取消）", lambda: (cp.ecore_on(), pump(0.3)))
-check("电源计划候选已扫描", lambda: need(cp.pow_table.rowCount() > 0, "候选表为空"))
-check("重新扫描 .pow", lambda: (cp.scan_pow(), wait_api(4)))
-check("导入并启用（无选中 → 仅提示）", lambda: (cp.pow_table.clearSelection(),
-                                        pump(0.1), cp.import_pow(), pump(0.3)))
-check("高性能模板（confirm 取消）", lambda: (cp.use_template("high"), pump(0.3)))
-check("卓越性能模板（confirm 取消）", lambda: (cp.use_template("ultimate"), pump(0.3)))
+check("写入处理器状态（打桩）", lambda: (pw.apply_states(), pump(0.3)))
+check("写入 EPP（打桩）", lambda: (pw.apply_epp(), pump(0.3)))
+check("切换电源计划（打桩）", lambda: (pw.apply_plan(), pump(0.3)))
+check("电源计划候选已扫描", lambda: need(pw.pow_table.rowCount() > 0, "候选表为空"))
+check("重新扫描 .pow", lambda: (pw.scan_pow(), wait_api(4)))
+check("导入并启用（无选中 → 仅提示）", lambda: (pw.pow_table.clearSelection(),
+                                        pump(0.1), pw.import_pow(), pump(0.3)))
+check("高性能模板（confirm 取消）", lambda: (pw.use_template("high"), pump(0.3)))
+check("卓越性能模板（confirm 取消）", lambda: (pw.use_template("ultimate"), pump(0.3)))
+
+check("EPP 快捷档位（打桩）", lambda: (pw.apply_epp_preset(80), pump(0.3)))
+check("读取各计划参数对比", lambda: (pw.load_plan_states(True), wait_api(10)))
+check("对比表已填行", lambda: need(pw.cmp_table.rowCount() > 0, "对比表为空"))
+check("恢复默认电源计划（confirm 取消）", lambda: (pw.reset_defaults(), pump(0.3)))
+check("电源计划右键菜单（删除/修改）", lambda: need(
+    callable(getattr(pw, "_plan_menu", None)) and callable(pw.modify_plan),
+    "电源计划菜单缺失"))
 
 print()
 print("=" * 62)
@@ -265,7 +334,9 @@ check("预设下拉已填充", lambda: need(
          if gp.preset.itemData(i) is not None]) == len(S.GPU_ALIAS_PRESETS) + 1,
     "预设项数不对"))
 check("预设清单够全（含分组分隔线）", lambda: need(
-    len(S.GPU_ALIAS_PRESETS) >= 60 and gp.preset.count() > len(S.GPU_ALIAS_PRESETS) + 1,
+    # 设计值：30 款预设 / 6 个分组；分隔线 = 组数-1，故 count == 30 + 1(自定义) + 5
+    len(S.GPU_ALIAS_PRESETS) >= 30 and len(S.GPU_ALIAS_GROUPS) >= 6
+    and gp.preset.count() == len(S.GPU_ALIAS_PRESETS) + 1 + (len(S.GPU_ALIAS_GROUPS) - 1),
     "预设清单过少或缺分组"))
 check("默认选中显卡并回显", lambda: (need(gp._cur_gpu() is not None, "无默认选中"),
                                need(gp.lb_state.text() not in ("", "—"), "状态未回显"),
@@ -376,7 +447,8 @@ w.goto("cleanup")
 cl.refresh()
 pump(0.3)
 check("进入页面不自动扫描", lambda: need(cl.table.rowCount() == 0, "自动扫描了"))
-check("垃圾扫描（真实只读）", lambda: (cl.scan(), wait_api(45)))
+check("垃圾扫描（真实只读）",
+      lambda: (cl.scan(), wait_until(lambda: cl.table.rowCount() > 0, 120)))
 check("扫描结果已列出", lambda: need(cl.table.rowCount() > 0, "扫描无结果"))
 check("勾选统计", lambda: (cl.update_sum(), pump(0.2)))
 check("清理（打桩 + confirm 取消）", lambda: (cl.clean(), pump(0.4)))
@@ -403,8 +475,11 @@ check("主题色预设逐个切换", lambda: (
 check("跟随系统强调色", lambda: (w.set_accent(""), pump(0.4)))
 check("暗色主题来回切换", lambda: (w.toggle_theme(), pump(0.6),
                               w.toggle_theme(), pump(0.6)))
-check("透明度滑块 + 确认", lambda: (se2.slider_op.setValue(85), pump(0.4),
-                               se2.slider_op.setValue(100), pump(0.4)))
+check("检查更新复选框联动", lambda: (
+    se2.cb_update.setChecked(False), pump(0.3),
+    need(se2.win.settings.get("check_update") is False, "未写入 check_update"),
+    se2.cb_update.setChecked(True), pump(0.3),
+    need(se2.win.settings.get("check_update") is True, "未写回 check_update")))
 check("关闭行为下拉联动", lambda: (
     se2.combo_close.setCurrentIndex(se2.combo_close.findData("tray")), pump(0.3),
     need(se2.win.settings.get("close_action") == "tray", "未写入 close_action"),

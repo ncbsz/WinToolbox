@@ -63,6 +63,7 @@ for entry, want_ok, want_val in cases:
         % (entry["tag"], entry["path"][:52], got_ok, got_val, want_ok, want_val))
 
 print("\n=== 2. 真实程序扫描 → 对话框 → _collect 往返（Qt 离屏）===")
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 qapp = QApplication(sys.argv)
 
@@ -79,9 +80,11 @@ res = S.residual_scan(pick.get("name") or "", pick.get("publisher") or "",
 print("  扫描: files=%d reg=%d" % (len(res["files"]), len(res["reg"])))
 
 import app as A
+# 铁律：测试脚本绝不写用户配置。这个脚本会构造真窗口，
+# 而 close() 在 close_action=exit 时会走 _quit_now → settings_save 覆盖用户设置。
+A.settings_save = lambda *a, **k: None
 dlg = A.ResidualDialog(None, pick.get("name"), res)
-got_regs = dlg._collect(dlg.tbl_reg, False)
-got_files = dlg._collect(dlg.tbl_files, True)
+got_files, got_regs = dlg._collect()
 chk(len(got_regs) == len(res["reg"]), "注册表项数量往返一致（%d）" % len(got_regs))
 same = all(g.get("hive") == o.get("hive") and g.get("path") == o.get("path")
            and (g.get("value") or "") == (o.get("value") or "")
@@ -136,6 +139,11 @@ os.makedirs(tmp_d, exist_ok=True)
 files = [{"path": tmp_d},
          {"path": r"C:\Windows\System32\drivers\etc\hosts"},
          {"path": r"D:\\"}]
+# 本组只验证「永久删除」分支：回收站与注册表备份打桩。这两条链路由第 3.5 组
+# 单独验证 —— 真跑会真的往用户回收站里放东西、真的往 backup 写 .reg。
+_real_recycle, _real_backup = S._recycle_one, S._reg_backup
+S._recycle_one = lambda p: ("failed", "")
+S._reg_backup = lambda hive, sub, stamp: "stub.reg"
 r = S.residual_clean(files, synthetic_regs)
 S.winreg = _real_reg
 msgs = r["msg"]
@@ -150,9 +158,9 @@ chk(any("拒绝" in m and "hosts" in m for m in msgs),
     "系统路径仍被拒绝（C:\\Windows 不在白名单）")
 chk(any("拒绝" in m and m.rstrip().rstrip("\\").endswith("D:") for m in msgs),
     "盘根本身仍被拒绝")
-chk(sum(1 for m in msgs if "拒绝（不在允许的目录内）" in m) == 2,
+chk(sum(1 for m in msgs if m.startswith("拒绝")) == 2,
     "文件侧恰好 2 项被拒（系统路径 + 盘根），实际 %d"
-    % sum(1 for m in msgs if "拒绝（不在允许的目录内）" in m))
+    % sum(1 for m in msgs if m.startswith("拒绝")))
 chk(len(calls["reg"]) == 4, "整键删除调用 4 次（厂商/产品/卸载项/服务），实际 %d" % len(calls["reg"]))
 chk(calls["delval"] == ["Foo"], "启动项走「删值」而非删键：%s" % calls["delval"])
 chk(len(calls["rmtree"]) == 1, "临时目录删除调用 1 次")
@@ -161,6 +169,63 @@ try:
     os.rmdir(tmp_d)
 except OSError:
     pass
+
+print("\n=== 3.5 删除流程（硬闸 · 回收站 · 备份失败即停）===")
+_user = os.environ.get("USERNAME") or "user"
+chk(all(S._is_protected_dir(p) for p in (
+    r"C:\Users", r"C:\ProgramData", r"C:\Windows", r"C:\Users\Public",
+    r"C:\Users\%s" % _user,
+    r"C:\Users\%s\AppData\Local" % _user,
+    r"C:\Users\%s\Desktop" % _user,
+    os.environ.get("TEMP") or r"C:\Temp", r"D:\\", r"C:\\")),
+    "任意层级的系统/容器目录全部判为受保护（不再只防盘根一层）")
+chk(not any(S._is_protected_dir(p) for p in (
+    r"C:\Program Files\MyOldApp", r"D:\SomeOldGame",
+    r"C:\Users\%s\AppData\Local\115Chrome" % _user,
+    r"C:\Users\%s\.vscode" % _user)),
+    "正常的程序目录 / 用户点目录不被误拦")
+
+# 证据链：只有「卸载程序已不存在」的记录才算数
+chk(callable(getattr(S, "_orphan_dir_evidence", None))
+    and callable(getattr(S, "_entry_gone_exe", None)),
+    "证据链函数齐备（_orphan_dir_evidence / _entry_gone_exe）")
+chk(S._entry_gone_exe({"uninstall": "", "quiet": ""}) == "",
+    "没有卸载命令的条目不算失效（不产生证据）")
+chk(S._entry_gone_exe({"uninstall": r"C:\绝对不存在\unins999.exe", "quiet": ""})
+    == r"C:\绝对不存在\unins999.exe",
+    "卸载程序不存在的条目算失效（产生证据）")
+chk(S._entry_gone_exe({"uninstall": "msiexec /x {1111}", "quiet": ""}) == "",
+    "MSI 条目不算失效（由系统维护）")
+
+# 回收站分支：文件走回收站、不再重复删除
+tmp_d2 = r"D:\_wtb_leftover_test2"
+os.makedirs(tmp_d2, exist_ok=True)
+calls["rmtree"].clear()
+S._recycle_one = lambda p: ("recycled", "")
+r_rb = S.residual_clean([{"path": tmp_d2}], [])
+chk(any("已移入回收站（可还原）" in m for m in r_rb["msg"]),
+    "回收站可用时如实报告「已移入回收站（可还原）」")
+chk(not calls["rmtree"], "走回收站时不再调用 rmtree（不会重复删）")
+
+# 「原处没了但没进回收站」→ 必须诚实说成永久删除，不能谎报可还原
+calls["rmtree"].clear()
+S._recycle_one = lambda p: ("gone", "该卷回收站不可用，已永久删除")
+r_gone = S.residual_clean([{"path": tmp_d2}], [])
+chk(any("该卷回收站不可用" in m for m in r_gone["msg"]),
+    "回收站没收到时如实报「已永久删除」，不谎报可还原")
+try:
+    os.rmdir(tmp_d2)
+except OSError:
+    pass
+
+# 备份失败 → 拒绝删除（先留退路原则）
+_n_before = len(calls["reg"])
+S._reg_backup = lambda *a, **k: ""
+r_bk = S.residual_clean([], [{"hive": "HKLM", "path": r"SOFTWARE\VendorX",
+                              "tag": "厂商键"}])
+chk(any("备份失败，未删除" in m for m in r_bk["msg"]) and len(calls["reg"]) == _n_before,
+    "注册表备份失败时跳过删除，不做裸删")
+S._recycle_one, S._reg_backup = _real_recycle, _real_backup
 
 print("\n=== 4. 覆盖面：登录数据 / 计划任务 / 点目录（新增类别）===")
 creds = S._scan_credentials({"workbuddy"}, set(), 20)
@@ -239,12 +304,18 @@ labels = [b.text() for b in sw.findChildren(QPushButton)]
 chk("扫描卸载残留" in labels, "软件管理页有「扫描卸载残留」按钮：%s" % labels[:8])
 chk(hasattr(sw, "orphan_scan"), "按钮处理函数存在")
 dlg2 = A.ResidualDialog(sw, "全机扫描", r3)
-chk(dlg2.tbl_files.rowCount() == len(r3["files"]), "对话框渲染了全部文件项")
-chk(dlg2.tbl_reg.rowCount() == len(r3["reg"]), "对话框渲染了全部注册表项")
-unchecked = sum(1 for i in range(dlg2.tbl_files.rowCount())
-                if dlg2.tbl_files.item(i, 0).checkState().value == 0)
+n_files = sum(1 for i in range(dlg2.tbl.rowCount())
+              if not (dlg2.tbl.item(i, 2).data(Qt.UserRole) or {}).get("hive"))
+chk(n_files == len(r3["files"]), "对话框渲染了全部文件项（%d）" % n_files)
+n_regs = dlg2.tbl.rowCount() - n_files
+chk(n_regs == len(r3["reg"]), "对话框渲染了全部注册表项（%d）" % n_regs)
+unchecked = sum(1 for i in range(dlg2.tbl.rowCount())
+                if dlg2.tbl.item(i, 0).checkState().value == 0)
 chk(unchecked == len(weak), "低置信项默认未勾选（%d 项 / 共 %d）" % (unchecked, len(weak)))
-win.close()
+# 不要 close()：close_action=ask 会弹模态框让脚本永久挂起，
+# close_action=exit 则会把用户 settings.json 写成测试值。
+win.hide()
+win.deleteLater()
 
 print("\n=== 结果 ===")
 print("全部通过" if not FAIL else "失败 %d 项: %s" % (len(FAIL), FAIL))

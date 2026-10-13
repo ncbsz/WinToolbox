@@ -9,7 +9,8 @@
   * 自动下载 UPX（首次），用 portable.spec 打包 + UPX 压缩；
   * 版本号从 app.py 的 APP_VER 读取；
   * 产物直接放 WinToolbox 目录与项目根目录（不建版本子目录）；
-  * --zip 时校验 zip < 25MB 且完整性通过。
+  * --zip 时校验 zip < 25MB 且完整性通过；
+  * 打包后自动重画 _preview 里的界面预览图（--no-preview 可跳过）。
 """
 import os
 import re
@@ -87,6 +88,31 @@ def readme_text():
             "GitHub：https://github.com/ncbsz/WinToolbox\n")
 
 
+def make_previews():
+    """重画 _preview\\ 里的界面预览图。
+
+    预览图以前是手工截的 —— 改完 UI 就过期，很容易「图与代码脱节」。
+    渲染较慢（十几个页面状态 × 两套主题），所以给个 --no-preview 逃生口；
+    失败不影响打包结果（只是预览图没更新）。
+    """
+    script = os.path.join(HERE, "tools", "make_previews.py")
+    if not os.path.isfile(script):
+        print("跳过预览图：找不到 tools/make_previews.py")
+        return
+    print("正在重画界面预览图（--no-preview 可跳过）…")
+    try:
+        r = subprocess.run([sys.executable, script], capture_output=True,
+                           text=True, errors="replace", cwd=HERE, timeout=900)
+    except subprocess.TimeoutExpired:
+        print("预览图超时，已跳过")
+        return
+    lines = [x for x in (r.stdout or "").splitlines() if x.strip()]
+    for line in lines[-3:]:
+        print("  " + line)
+    if r.returncode != 0:
+        print((r.stderr or "")[-600:])
+
+
 def make_zip(exe):
     zpath = os.path.join(HERE, "WinToolbox-便携版.zip")
     with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
@@ -104,6 +130,8 @@ def make_zip(exe):
 if __name__ == "__main__":
     t0 = time.time()
     exe = build()
+    if "--no-preview" not in sys.argv:
+        make_previews()
     if "--zip" in sys.argv:
         make_zip(exe)
     print("DONE %.0fs" % (time.time() - t0))

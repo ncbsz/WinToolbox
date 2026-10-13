@@ -159,9 +159,9 @@ PAGES.overview = async () => {
           <button class="btn" id="q-diag">网络快速诊断</button>
         </div>
         <div class="notice info" style="margin-top:14px;margin-bottom:0">
-          本工具是<b>功能整合版</b>：优化项来自 ZyperWin++ 的思路，卸载/启动项/服务来自 HiBit Uninstaller，
-          内存监控与整理来自 Sunlight 内存整理，网络诊断修复来自 360 断网急救箱，策略诊断针对
-          “受组织管理”问题。全部<b>重新实现</b>，未复用任何被感染文件中的代码。
+          本工具是<b>功能整合版</b>：系统优化、软件卸载、启动项与服务管理、内存监控与整理、
+          网络诊断修复、策略诊断（针对“受组织管理”问题）等功能集中在一处。全部<b>自行实现</b>，
+          未复用任何第三方代码。
         </div>
       </div>
     </div>`;
@@ -232,7 +232,11 @@ PAGES.optimize = async () => {
   const rules = state.rules;
   const cats = {};
   rules.forEach(r => { (cats[r.category] = cats[r.category] || []).push(r); });
-  const catName = { explorer: '资源管理器', performance: '性能优化', privacy: '隐私保护', update: '系统更新', edge: 'Edge 浏览器', security: '安全防护', system: '系统偏好' };
+  const catName = { explorer: '资源管理器', performance: '性能优化', privacy: '隐私保护',
+                    update: '系统更新', edge: 'Edge 浏览器', security: '安全防护',
+                    system: '系统偏好', personal: '个性化', network: '网络和 Internet',
+                    gaming: '游戏', apps: '应用', input: '输入与键盘',
+                    appperm: '应用权限', cortana: 'Cortana 与搜索' };
   const policyCount = rules.filter(r => r.risk === 'policy').length;
 
   content.innerHTML = `
@@ -345,7 +349,6 @@ PAGES.software = async () => {
       <input type="search" id="sw-q" placeholder="搜索程序名 / 发布者" style="width:260px">
       <span class="pill" id="sw-n">共 ${list.length} 个</span>
       <div class="spacer"></div>
-      <button class="btn" id="sw-left">残留扫描</button>
     </div>
     <div class="card"><div class="scroll-y" id="sw-body"></div></div>`;
 
@@ -377,17 +380,6 @@ PAGES.software = async () => {
   }
   paint();
   $('#sw-q').oninput = e => { kw = e.target.value.trim().toLowerCase(); paint(); };
-  $('#sw-left').onclick = async () => {
-    const k = prompt('输入已卸载程序的关键词，扫描残留文件/目录（≥3 字符）');
-    if (!k || k.trim().length < 3) return;
-    try {
-      const r = await post('/api/soft/leftover', { keyword: k.trim() });
-      if (!r.length) return toast('未发现残留目录', 'ok');
-      $('#sw-body').innerHTML = `<div class="notice warn">发现 ${r.length} 条可能残留，请<b>人工确认</b>后再删除：</div>` +
-        r.map(x => row(`<div class="grow"><div class="t mono">${esc(x.path)}</div>
-          <div class="s">${x.is_dir ? '目录' : '文件'} · ${fmtBytes(x.size)}</div></div>`)).join('');
-    } catch (e) { toast(e.message, 'err'); }
-  };
 };
 
 /* ---------------- 启动与服务 ---------------- */
@@ -400,9 +392,9 @@ PAGES.startup = async () => {
       <div class="card-head"><h2>开机启动项</h2><div class="spacer"></div>
         <span class="pill">${startup.length} 项</span></div>
       <div class="scroll-y">${startup.length ? startup.map((x, i) => row(`
-        <div class="grow"><div class="t">${esc(x.name)} ${x.hive === 'DIR' ? '<span class="tag warn">启动文件夹</span>' : ''}</div>
+        <div class="grow"><div class="t">${esc(x.name)} ${x.publisher ? `<span class="s">${esc(x.publisher)}</span>` : ''} ${x.folder ? '<span class="tag warn">启动文件夹</span>' : ''} ${x.enabled === false ? '<span class="tag warn">已禁用</span>' : ''}</div>
           <div class="s mono">${esc(x.cmd)}</div></div>
-        ${x.hive === 'DIR' ? '' : `<button class="btn sm danger" data-i="${i}">移除</button>`}`)).join('')
+        ${x.folder ? '' : `<button class="btn sm danger" data-i="${i}">${x.enabled === false ? '启用' : '禁用'}</button>`}`)).join('')
         : '<div class="empty">没有自启动项</div>'}</div>
     </div>
     <div class="card">
@@ -443,11 +435,17 @@ PAGES.startup = async () => {
 
   content.querySelectorAll('button[data-i]').forEach(b => b.onclick = async () => {
     const x = startup[+b.dataset.i];
-    if (!await confirmBox('移除启动项', `删除 <b>${esc(x.name)}</b> 的自启动注册表项？`, '移除', true)) return;
+    // 这个按钮做的是「启用 / 禁用」（写 StartupApproved 标志，不删注册表值），
+    // 早先文案写成「移除 / 删除注册表项」，与实际行为对不上。
+    const on = x.enabled === false;
+    const act = on ? '启用' : '禁用';
+    if (!await confirmBox(act + '启动项',
+        `确定${act} <b>${esc(x.name)}</b>？` +
+        (on ? '' : '<br><span class="s">条目会保留，随时可以再启用。</span>'), act, false)) return;
     busy(b, true);
     try {
-      await post('/api/startup/toggle', { hive: x.hive, path: x.path, name: x.name, enable: false });
-      toast('已移除', 'ok'); PAGES.startup();
+      await post('/api/startup/toggle', { hive: x.hive, path: x.path, name: x.name, enable: on });
+      toast('已' + act, 'ok'); PAGES.startup();
     } catch (e) { toast(e.message, 'err'); busy(b, false); }
   });
 };
@@ -705,7 +703,10 @@ PAGES.policies = async () => {
        出问题双击备份即可还原。<br><br>清除后<b>需要重启</b>，“由你的组织管理”才会消失。`, '清除', true)) return;
     busy(e.target, true, '清除中');
     try {
-      const r = await post('/api/policies/fix', { paths });
+      // 后端返回的是 {results, backups, backup_dir}，不是数组 ——
+      // 直接 r.filter() 会抛 "r.filter is not a function"，明明清成功了却报失败。
+      const d = await post('/api/policies/fix', { paths });
+      const r = d.results || [];
       toast(`已清除 ${r.filter(x => x.ok).length} / ${r.length} 处，备份在 backup\\ 目录`, 'ok');
       $('#pl-out').innerHTML = r.map(x => row(`
         <span class="tag ${x.ok ? 'ok' : 'err'}">${x.ok ? '已清除' : '失败'}</span>
